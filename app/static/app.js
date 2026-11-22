@@ -178,7 +178,7 @@
         else if (S.pendingSounds === f.id) {
           S.pendingSounds = null;
           const c = Object.entries(f.sounds || {}).sort((a, b) => b[1] - a[1]);
-          toast(c.length ? `Found ${c.map(([l, n]) => `${n} ${l.toLowerCase()}`).join(", ")}` : "No laughs, coughs or other sounds found", false,
+          toast(c.length ? `Found ${c.map(([l, n]) => `${n} ${soundWord(l, n)}`).join(", ")}` : "No laughs, coughs or other sounds found", false,
             { label: "Show stats", fn: () => $("statsBtn").click() });
         }
         else toast(prev.status === "diarizing" ? speakerToast(f) : "Transcription finished");
@@ -540,6 +540,8 @@
 
   // ------------------------------------------------------------------ speakers
   function spkColor(id) {
+    const own = S.speakers[id]?.color;
+    if (own && /^#[0-9a-f]{6}$/i.test(own)) return own;
     const keys = Object.keys(S.speakers);
     const i = keys.indexOf(id);
     return SPK_COLORS[(i < 0 ? 0 : i) % SPK_COLORS.length];
@@ -558,7 +560,9 @@
     for (const s of S.segs) if (s.speaker) { talk[s.speaker] = (talk[s.speaker] || 0) + (s.end - s.start); total += s.end - s.start; }
     for (const id of ids) {
       const li = el("li");
-      const sw = el("span", "sw"); sw.style.background = spkColor(id);
+      const sw = el("button", "sw"); sw.style.background = spkColor(id);
+      sw.title = "Change color";
+      sw.onclick = (e) => { e.stopPropagation(); openColorPop(id, sw); };
       const box = el("div"); box.style.minWidth = "0";
       const input = el("input"); input.value = spkName(id); input.spellcheck = false;
       input.oninput = () => {
@@ -707,6 +711,46 @@
     hideSpkMenu();
     renderSegments(); renderSpeakers(); queueSave();
   }
+
+  // ---- speaker colors
+  const SWATCHES = ["#7c6cff", "#22c3d8", "#f472b6", "#34d399", "#fb923c", "#60a5fa", "#e5b80b", "#a78bfa",
+    "#f87171", "#84cc16", "#14b8a6", "#e879f9", "#94a3b8", "#c08457"];
+  function openColorPop(id, anchor) {
+    S.colorTarget = id;
+    const pop = $("colorPop");
+    $("colorTitle").textContent = `Color for ${spkName(id)}`;
+    const grid = $("colorGrid"); grid.innerHTML = "";
+    const cur = spkColor(id).toLowerCase();
+    const taken = new Set(Object.keys(S.speakers).filter((x) => x !== id).map((x) => spkColor(x).toLowerCase()));
+    for (const c of SWATCHES) {
+      const b = el("button", "color-sw" + (c === cur ? " cur" : "") + (taken.has(c) ? " taken" : ""));
+      b.style.background = c;
+      b.title = taken.has(c) ? `${c} (another speaker uses this)` : c;
+      b.onclick = () => setSpeakerColor(id, c);
+      grid.append(b);
+    }
+    $("colorCustom").value = cur;
+    pop.classList.remove("hidden");
+    const r = anchor.getBoundingClientRect();
+    pop.style.left = Math.max(8, Math.min(r.left, innerWidth - pop.offsetWidth - 8)) + "px";
+    pop.style.top = (r.bottom + pop.offsetHeight + 8 > innerHeight ? r.top - pop.offsetHeight - 6 : r.bottom + 6) + "px";
+  }
+  function hideColorPop() { $("colorPop").classList.add("hidden"); S.colorTarget = null; }
+  function setSpeakerColor(id, color, close = true) {
+    if (!S.speakers[id]) return;
+    if (color) S.speakers[id].color = color.toLowerCase(); else delete S.speakers[id].color;
+    if (close) hideColorPop();
+    renderSegments(); renderSpeakers(); drawWave();
+    queueSave();
+    // remembered voices keep their color in future files
+    const v = S.speakers[id].voice ? S.voices.find((x) => x.id === S.speakers[id].voice)
+      : S.voices.find((x) => x.name.trim().toLowerCase() === spkName(id).trim().toLowerCase());
+    if (v) api(`/api/voices/${v.id}`, { method: "PATCH", body: JSON.stringify({ color: color || "" }) }).then((r) => { v.color = r.color; }).catch(() => {});
+  }
+  $("colorCustom").addEventListener("input", (e) => { if (S.colorTarget) setSpeakerColor(S.colorTarget, e.target.value, false); });
+  $("colorCustom").addEventListener("change", () => hideColorPop());
+  $("colorReset").onclick = () => { if (S.colorTarget) setSpeakerColor(S.colorTarget, null); };
+  document.addEventListener("mousedown", (x) => { if (S.colorTarget && !x.target.closest("#colorPop")) hideColorPop(); });
 
   // ------------------------------------------------------------------ flags
   function isFlagged(s) {
@@ -2079,7 +2123,7 @@
     }
     T.clips.push(...picks.sort((a, b) => a - b));
   }
-  function personColor(T, id) { return SPK_COLORS[Math.max(0, T.people.findIndex((p) => p.id === id)) % SPK_COLORS.length]; }
+  function personColor(T, id) { return S.speakers[id] ? spkColor(id) : SPK_COLORS[Math.max(0, T.people.findIndex((p) => p.id === id)) % SPK_COLORS.length]; }
   function renderTrainer() {
     const T = S.tr;
     if (!T) return;
@@ -2581,7 +2625,7 @@
   /** Small emoji badges on lines where a sound happened (click: play it). */
   function markSoundRows() {
     document.querySelectorAll(".seg-sounds").forEach((x) => x.remove());
-    const ev = S.sounds?.events || [];
+    const ev = (S.sounds?.events || []).filter((e) => !e.removed);
     if (!ev.length || !S.segs.length) return;
     const groups = S.sounds.groups || {};
     const per = new Map();
@@ -2599,13 +2643,70 @@
       const box = el("span", "seg-sounds");
       for (const e of list.slice(0, 4)) {
         const b = el("button", "snd", groups[e.label]?.emoji || "•");
-        b.title = `${e.label}${e.speaker ? ` · ${spkName(e.speaker)}${e.sure ? "" : " (guess)"}` : ""} at ${fmt(e.start)} · ${Math.round(e.p * 100)}% sure · click to hear it`;
-        b.onclick = (x) => { x.stopPropagation(); playSpan(e.start - 0.5, e.end + 0.5); };
+        b.title = `${e.label}${e.speaker ? ` · ${spkName(e.speaker)}${e.sure ? "" : " (guess)"}` : ""} at ${fmt(e.start)} · click to hear, fix who or remove`;
+        b.onclick = (x) => { x.stopPropagation(); openSoundMenu(e, b); };
         box.append(b);
       }
       left.append(box);
     }
   }
+  // Click a sound: play it, say who made it, correct the kind of sound, or remove it.
+  function hideSoundMenu() { $("sndMenu").classList.add("hidden"); S.sndTarget = null; }
+  function openSoundMenu(e, anchor) {
+    const m = $("sndMenu");
+    const groups = S.sounds?.groups || {};
+    S.sndTarget = e;
+    m.innerHTML = "";
+    m.append(el("div", "red-info", `${groups[e.label]?.emoji || ""} ${e.label} at ${fmt(e.start)} · ${Math.round(e.p * 100)}% sure`));
+    const play = el("button", null); play.append(el("b", null, "▶ Play it"));
+    play.onclick = () => { hideSoundMenu(); playSpan(e.start - 0.5, e.end + 0.5); };
+    m.append(play);
+    if (groups[e.label]?.personal !== false && Object.keys(S.speakers).length) {
+      m.append(el("div", "snd-sec", "Who made it?"));
+      const who = el("div", "snd-opts");
+      for (const id of Object.keys(S.speakers)) {
+        const b = el("button", "snd-opt" + (e.speaker === id ? " cur" : ""));
+        const dot = el("i"); dot.style.background = spkColor(id);
+        b.append(dot, document.createTextNode(spkName(id) + (e.speaker === id && !e.sure ? " (guess)" : "")));
+        b.onclick = () => editSound(e, { speaker: id }, `${e.label} now belongs to ${spkName(id)}`);
+        who.append(b);
+      }
+      const nobody = el("button", "snd-opt" + (!e.speaker ? " cur" : ""), "Someone else");
+      nobody.onclick = () => editSound(e, { speaker: "" }, "Not counted for anyone");
+      who.append(nobody);
+      m.append(who);
+    }
+    m.append(el("div", "snd-sec", "It's actually…"));
+    const kinds = el("div", "snd-opts");
+    for (const [g, info] of Object.entries(groups)) {
+      if (g === e.label || !info.personal) continue;
+      const b = el("button", "snd-opt", `${info.emoji} ${g}`);
+      b.onclick = () => editSound(e, { label: g }, `Changed to ${g.toLowerCase()}`);
+      kinds.append(b);
+    }
+    m.append(kinds);
+    const rm = el("button", "danger"); rm.append(el("b", null, "Remove"), el("small", null, "Not a real sound, don't count it"));
+    rm.onclick = () => editSound(e, { removed: true }, `${e.label} removed`, () => editSound(e, { removed: false }, "Restored"));
+    m.append(rm);
+    m.classList.remove("hidden");
+    const r = anchor.getBoundingClientRect();
+    const mh = m.offsetHeight, mw = m.offsetWidth;
+    m.style.left = Math.max(8, Math.min(r.left, innerWidth - mw - 8)) + "px";
+    m.style.top = (r.bottom + mh + 8 > innerHeight ? Math.max(8, r.top - mh - 6) : r.bottom + 6) + "px";
+  }
+  async function editSound(e, body, msg, undo = null) {
+    hideSoundMenu();
+    try {
+      const upd = await api(`/api/files/${S.current.id}/sounds/${e.id}`, { method: "PATCH", body: JSON.stringify(body) });
+      Object.assign(e, upd);
+      if (body.removed === false) delete e.removed;
+      markSoundRows();
+      if (S.modal === "statsModal") { const sc = $("statsBody").scrollTop; renderStats(); $("statsBody").scrollTop = sc; }
+      toast(msg, false, undo ? { label: "Undo", fn: undo } : null);
+    } catch (err) { toast(err.message, true); }
+  }
+  document.addEventListener("mousedown", (x) => { if (!x.target.closest("#sndMenu")) hideSoundMenu(); });
+  document.addEventListener("keydown", (x) => { if (x.key === "Escape" && S.sndTarget) { x.stopPropagation(); hideSoundMenu(); } }, true);
   function playSpan(a, b) {
     seekTo(Math.max(0, a), true, true);
     S.stopAt = b;
@@ -2683,7 +2784,7 @@
     }
     // sounds per speaker
     for (const e of S.sounds?.events || []) {
-      if (e.speaker && sp[e.speaker]) sp[e.speaker].sounds[e.label] = (sp[e.speaker].sounds[e.label] || 0) + 1;
+      if (!e.removed && e.speaker && sp[e.speaker]) sp[e.speaker].sounds[e.label] = (sp[e.speaker].sounds[e.label] || 0) + 1;
     }
     const talkTotal = Object.values(sp).reduce((a, x) => a + x.talk, 0);
     const duration = S.current?.duration || (segs.length ? segs[segs.length - 1].end : 0);
@@ -2696,6 +2797,11 @@
     return { sp, ids: Object.keys(sp).filter((id) => sp[id].words || sp[id].talk), runs, total, talkTotal, duration, longestGap, busiest, bucket, allFreq, allGrams, segs };
   }
 
+  function soundWord(label, n) {
+    const one = { Laughter: "laugh", Crying: "cry", "Throat clearing": "throat clear", Applause: "applause", Music: "music", Singing: "singing" }[label] || label.toLowerCase();
+    if (n === 1 || ["applause", "music", "singing"].includes(one)) return one;
+    return one === "cry" ? "cries" : one.endsWith("s") || one.endsWith("sh") ? one + "es" : one + "s";
+  }
   function topN(map, n, min = 2) { return [...map].filter(([, c]) => c >= min).sort((a, b) => b[1] - a[1]).slice(0, n); }
   /** Phrases this speaker says much more than the others (log-odds-ish). */
   function signature(st, all, n) {
@@ -2795,7 +2901,7 @@
       const snd = Object.entries(st.sounds).sort((a, b) => b[1] - a[1]);
       if (snd.length || st.written) {
         const g = S.sounds?.groups || {};
-        item("Sounds", [...snd.map(([l, n]) => `${g[l]?.emoji || ""} ${n} ${l.toLowerCase()}${n > 1 && !/s$/.test(l) ? "s" : ""}`), st.written ? `${st.written} written laughs` : null].filter(Boolean).join(" · "));
+        item("Sounds", [...snd.map(([l, n]) => `${g[l]?.emoji || ""} ${n} ${soundWord(l, n)}`), st.written ? `${st.written} written laughs` : null].filter(Boolean).join(" · "));
       }
       card.append(dl);
       const words = topN(st.freq, 12);
@@ -2848,27 +2954,29 @@
       };
       ss.append(go);
     } else {
+      const live = snd.events.filter((e) => !e.removed);
       const counts = {};
-      for (const e of snd.events) counts[e.label] = (counts[e.label] || 0) + 1;
+      for (const e of live) counts[e.label] = (counts[e.label] || 0) + 1;
       const order = Object.entries(counts).sort((a, b) => b[1] - a[1]);
       if (!order.length) ss.append(el("p", "muted small", "No laughs, coughs or other sounds were detected."));
       const tl = el("div", "st-chips");
       for (const [l, n] of order) tl.append(el("span", "st-chip static", `${snd.groups[l]?.emoji || ""} ${l} ${n}`));
       ss.append(tl);
       const list = el("ul", "st-events");
-      for (const e of snd.events.slice(0, 200)) {
+      for (const e of live.slice(0, 300)) {
         const li = el("li");
         li.append(el("span", "em", snd.groups[e.label]?.emoji || "•"), timeLink(e.start));
         li.append(el("span", null, e.label + (e.speaker ? ` · ${names(e.speaker)}${e.sure ? "" : " (guess)"}` : "")));
-        const play = el("button", "linklike", "▶ play");
-        play.onclick = () => playSpan(e.start - 0.5, e.end + 0.5);
-        li.append(play);
+        const edit = el("button", "linklike", "edit");
+        edit.title = "Play it, change who made it, or remove it";
+        edit.onclick = (x) => { x.stopPropagation(); openSoundMenu(e, edit); };
+        li.append(edit);
         list.append(li);
       }
       ss.append(list);
       const again = el("button", "btn sm", "Detect again");
       again.onclick = async () => { try { S.current = await api(`/api/files/${S.current.id}/sounds`, { method: "POST" }); S.pendingSounds = S.current.id; closeModal(); renderHeader(); await loadFiles(); schedulePoll(); } catch (e) { toast(e.message, true); } };
-      ss.append(el("p", "muted small", "Detected by a small sound model, so expect some misses and false alarms. Who made each sound is matched by voice when it's clear, otherwise it's whoever was talking (marked guess)."), again);
+      ss.append(el("p", "muted small", "Detected by a small sound model, so expect some misses and false alarms. Who made each sound is matched by voice when it's clear, otherwise it's whoever was talking (marked guess). Click edit (or the emoji on a line) to fix who it was or remove it; detecting again keeps your fixes."), again);
     }
     body.append(ss);
   }

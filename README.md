@@ -29,6 +29,8 @@ A self-hosted web front end for speech-to-text models served through [llama-swap
   - It finds laughter, coughs, sneezes, throat clearing, sighs, gasps, crying, applause, singing, music and pets.
   - Each sound is matched to a speaker by voice where possible, otherwise to whoever was talking.
   - Sounds show as clickable emoji on the transcript lines and count toward each speaker's stats.
+  - Click one to play it, change who made it (e.g. you were talking but your co-host laughed), correct the kind of sound, or remove a false alarm. Detecting again keeps your corrections.
+- **Speaker colors**: click a speaker's dot in the Speakers panel to pick a color (or a custom one). Remembered voices keep their color in future files.
 - **Find & replace** (⋯ menu or Ctrl+H) with match case / whole word and a preview; redacted text is never touched.
 - **Names and special terms** in the transcribe dialog help models spell names right.
   - MOSS hotwords, the whisper prompt, or an instruction in chat mode.

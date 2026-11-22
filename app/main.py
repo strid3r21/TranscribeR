@@ -214,6 +214,9 @@ def remember_voice(name: str, vec, count: int) -> dict:
     return v
 
 
+HEX_COLOR = re.compile(r"#[0-9a-fA-F]{6}")
+
+
 def name_from_voices(speakers: dict, centroids: dict) -> dict:
     """Rename diarized speakers that match a saved voice; strips internal keys."""
     voices = load_voices()
@@ -221,7 +224,8 @@ def name_from_voices(speakers: dict, centroids: dict) -> dict:
     out = {}
     for label, info in speakers.items():
         v = matched.get(info.get("_idx"))
-        out[label] = {"name": v["name"], "voice": v["id"]} if v else {"name": info["name"]}
+        out[label] = ({"name": v["name"], "voice": v["id"], **({"color": v["color"]} if v.get("color") else {})}
+                      if v else {"name": info["name"]})
     return out
 
 
@@ -397,6 +401,7 @@ async def job_diarize(fid: str, opts: dict) -> None:
         speakers = name_from_voices(asr.assign_speakers(pseudo, turns), cents)
         # Carry user-given names over: each new speaker inherits the old speaker it overlaps most.
         old_names = {k: v.get("name") for k, v in (t.get("speakers") or {}).items()}
+        old_colors = {k: v.get("color") for k, v in (t.get("speakers") or {}).items()}
         overlap: dict[tuple[str, str], float] = {}
         for s, p in zip(segs, pseudo):
             if s.get("speaker") and p.get("spk"):
@@ -406,9 +411,11 @@ async def job_diarize(fid: str, opts: dict) -> None:
         for (new, old), _ in sorted(overlap.items(), key=lambda kv: -kv[1]):
             if (new in speakers and old not in used and not speakers[new].get("_named")
                     and not speakers[new].get("voice") and old_names.get(old)):
-                speakers[new] = {"name": old_names[old], "_named": True}
+                speakers[new] = {"name": old_names[old], "_named": True,
+                                 **({"color": old_colors[old]} if old_colors.get(old) else {})}
                 used.add(old)
-        speakers = {k: {"name": v["name"]} for k, v in speakers.items()}
+        speakers = {k: {"name": v["name"], **({"color": v["color"]} if v.get("color") else {}),
+                        **({"voice": v["voice"]} if v.get("voice") else {})} for k, v in speakers.items()}
         for s, p in zip(segs, pseudo):
             s["speaker"] = p.get("spk")
             s.pop("spk_locked", None)
@@ -502,10 +509,9 @@ async def job_sounds(fid: str, opts: dict) -> None:
             return events
 
         events = await loop.run_in_executor(None, work)
+        events = keep_sound_edits(events, (read_json(d / "sounds.json") or {}).get("events") or [])
         write_json(d / "sounds.json", {"created": time.time(), "model": "ced-mini", "events": events})
-        counts: dict[str, int] = {}
-        for e in events:
-            counts[e["label"]] = counts.get(e["label"], 0) + 1
+        counts = sound_counts(events)
         log.info("sounds for %s: %s", fid, counts)
         settle_status(fid, error=None, sounds=counts)
     except Exception as exc:  # noqa: BLE001
@@ -903,7 +909,8 @@ async def save_transcript(fid: str, body: TranscriptIn) -> dict:
         t["markers"] = clean_markers(body.markers)
     if body.speakers is not None:
         t["speakers"] = {str(k): {"name": str((v or {}).get("name", k))[:80],
-                                  **({"voice": v["voice"]} if (v or {}).get("voice") else {})}
+                                  **({"voice": v["voice"]} if (v or {}).get("voice") else {}),
+                                  **({"color": v["color"].lower()} if HEX_COLOR.fullmatch(str((v or {}).get("color") or "")) else {})}
                          for k, v in body.speakers.items()}
     t["updated"] = time.time()
     write_json(path, t)
@@ -1171,11 +1178,12 @@ async def start_identify(fid: str, body: IdentifyBody) -> dict:
 
 @app.get("/api/voices")
 async def list_voices() -> list[dict]:
-    return [{k: v[k] for k in ("id", "name", "n", "updated")} for v in load_voices()]
+    return [{k: v.get(k) for k in ("id", "name", "n", "updated", "color")} for v in load_voices()]
 
 
 class VoiceRename(BaseModel):
-    name: str
+    name: Optional[str] = None
+    color: Optional[str] = None  # "" clears it
 
 
 @app.patch("/api/voices/{vid}")
@@ -1184,9 +1192,14 @@ async def rename_voice(vid: str, body: VoiceRename) -> dict:
     v = next((v for v in voices if v["id"] == vid), None)
     if not v:
         raise HTTPException(404, "Voice not found")
-    v["name"] = body.name.strip()[:80] or v["name"]
+    if body.name is not None:
+        v["name"] = body.name.strip()[:80] or v["name"]
+    if body.color is not None:
+        if body.color and not HEX_COLOR.fullmatch(body.color):
+            raise HTTPException(400, "Color must look like #7c6cff")
+        v["color"] = body.color.lower() or None
     save_voices(voices)
-    return {k: v[k] for k in ("id", "name", "n", "updated")}
+    return {k: v.get(k) for k in ("id", "name", "n", "updated", "color")}
 
 
 @app.delete("/api/voices/{vid}")
@@ -1569,6 +1582,66 @@ async def bench_diff(bid: str, rid: str) -> dict:
 
 
 # ---- sounds --------------------------------------------------------------- #
+
+
+def sound_counts(events: list[dict]) -> dict:
+    counts: dict[str, int] = {}
+    for e in events:
+        if not e.get("removed"):
+            counts[e["label"]] = counts.get(e["label"], 0) + 1
+    return counts
+
+
+def keep_sound_edits(new: list[dict], old: list[dict]) -> list[dict]:
+    """Re-detection keeps the user's corrections: removed sounds stay removed, changed ones stay changed."""
+    edited = [e for e in old if e.get("removed") or e.get("edited") or e.get("manual")]
+    out = []
+    for e in new:
+        match = next((o for o in edited if not o.get("_used") and o["start"] < e["end"] and o["end"] > e["start"]
+                      and (o.get("orig_label") or o["label"]) == e["label"]), None)
+        if match:
+            match["_used"] = True
+            e.update({k: match[k] for k in ("label", "speaker", "removed", "edited", "orig_label") if k in match})
+            if match.get("edited"):
+                e["sure"] = True
+        out.append(e)
+    out += [{k: v for k, v in o.items() if k != "_used"} for o in edited if o.get("manual") and not o.get("_used")]
+    for o in edited:
+        o.pop("_used", None)
+    out.sort(key=lambda e: e["start"])
+    for i, e in enumerate(out):
+        e["id"] = i
+    return out
+
+
+class SoundPatch(BaseModel):
+    speaker: Optional[str] = None  # "" = nobody in particular
+    label: Optional[str] = None
+    removed: Optional[bool] = None
+
+
+@app.patch("/api/files/{fid}/sounds/{eid}")
+async def edit_sound(fid: str, eid: int, body: SoundPatch) -> dict:
+    load_meta(fid)
+    d = fdir(fid)
+    data = read_json(d / "sounds.json")
+    e = next((x for x in (data or {}).get("events", []) if x.get("id") == eid), None)
+    if e is None:
+        raise HTTPException(404, "Sound not found")
+    if body.label is not None:
+        if body.label not in sounds.GROUPS:
+            raise HTTPException(400, "Unknown sound type")
+        e.setdefault("orig_label", e["label"])
+        e["label"] = body.label
+    if body.speaker is not None:
+        e["speaker"] = body.speaker or None
+        e["sure"] = True
+    if body.removed is not None:
+        e["removed"] = body.removed
+    e["edited"] = True
+    write_json(d / "sounds.json", data)
+    update_meta(fid, sounds=sound_counts(data["events"]))
+    return e
 
 
 @app.get("/api/files/{fid}/sounds")
