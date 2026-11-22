@@ -42,6 +42,8 @@
     spkScope: "seg",
     voices: [],
     stopAt: null,
+    pausedByFocus: false,
+    ctx: null, // pending redaction target
     tr: null, // trainer state
   };
 
@@ -340,7 +342,7 @@
     $("playerCard").classList.toggle("hidden", !!(f && !f.has_audio && f.status !== "processing"));
     $("audioGone").classList.toggle("hidden", !(f && f.audio_deleted));
     if (!usable) { audio.removeAttribute("src"); S.peaks = []; drawWave(); return; }
-    const src = `/api/files/${f.id}/audio`;
+    const src = `/api/files/${f.id}/audio?v=${f.audio_version || 0}`;
     if (!audio.src.endsWith(src)) {
       audio.src = src;
       audio.playbackRate = parseFloat($("rateSelect").value);
@@ -651,7 +653,35 @@
     return cssVar("--warn");
   }
 
+  const REDACTED = "[REDACTED]";
+  /** Wrap every [REDACTED] marker in an atomic, non-editable bar. */
+  function markRedactions(node) {
+    if (!node.textContent.includes(REDACTED)) return;
+    const walker = document.createTreeWalker(node, NodeFilter.SHOW_TEXT);
+    const texts = [];
+    let t;
+    while ((t = walker.nextNode())) if (t.data.includes(REDACTED) && !t.parentElement.classList.contains("redacted")) texts.push(t);
+    for (const tn of texts) {
+      const parts = tn.data.split(REDACTED);
+      const frag = document.createDocumentFragment();
+      parts.forEach((p, k) => {
+        if (p) frag.append(document.createTextNode(p));
+        if (k < parts.length - 1) {
+          const bar = el("span", "redacted", REDACTED);
+          bar.contentEditable = "false";
+          bar.title = "Redacted";
+          frag.append(bar);
+        }
+      });
+      tn.replaceWith(frag);
+    }
+  }
+
   function fillText(node, s) {
+    fillTextInner(node, s);
+    markRedactions(node);
+  }
+  function fillTextInner(node, s) {
     node.textContent = "";
     const q = S.search.toLowerCase();
     if (q && s.text.toLowerCase().includes(q)) {
@@ -776,6 +806,14 @@
     queueSave();
     pauseForTyping();
   });
+  segBox.addEventListener("focusin", (e) => {
+    if (!e.target.closest(".seg-text") || !$("typingToggle").checked) return;
+    if (!audio.paused && S.stopAt == null) {
+      audio.pause();
+      S.pausedByFocus = true;
+      S.resumeAfterTyping = false; clearTimeout(S.typingTimer);
+    }
+  });
   segBox.addEventListener("focusout", (e) => {
     const txt = e.target.closest(".seg-text");
     if (!txt || !txt.isConnected) return;
@@ -793,8 +831,16 @@
       e.preventDefault();
       const next = rowEl(i + 1);
       if (next) placeCaret(next.querySelector(".seg-text"), Infinity); else txt.blur();
-    } else if (e.key === "Escape") txt.blur();
-    else if (e.key === "Backspace" && i > 0 && caretOffset(txt) === 0 && !getSelection().toString()) {
+    } else if (e.key === "Escape") {
+      txt.blur();
+      if (S.pausedByFocus && audio.paused) {
+        S.pausedByFocus = false;
+        audio.currentTime = Math.max(0, audio.currentTime - 1);
+        audio.play().catch(() => {});
+      }
+    } else if (e.altKey && e.code === "KeyX") {
+      e.preventDefault(); e.stopPropagation(); redactSelection(false, false);
+    } else if (e.key === "Backspace" && i > 0 && caretOffset(txt) === 0 && !getSelection().toString()) {
       e.preventDefault(); mergeWithPrevious(i);
     } else if (e.altKey && e.code === "KeyS") {
       e.preventDefault(); e.stopPropagation(); splitAt(i, caretOffset(txt));
@@ -1038,7 +1084,7 @@
   $("typingToggle").onchange = (e) => store.set("typing", e.target.checked);
 
   const PLAY = '<path d="M8 5v14l11-7z"/>', PAUSE = '<path d="M7 5h3.5v14H7zM13.5 5H17v14h-3.5z"/>';
-  audio.addEventListener("play", () => { $("playIcon").innerHTML = PAUSE; tick(); });
+  audio.addEventListener("play", () => { $("playIcon").innerHTML = PAUSE; S.pausedByFocus = false; tick(); });
   audio.addEventListener("pause", () => { $("playIcon").innerHTML = PLAY; drawWave(); if (S.tr) trPlaying(null); });
   audio.addEventListener("loadedmetadata", () => { $("durTime").textContent = fmt(audio.duration); drawWave(); });
   audio.addEventListener("timeupdate", () => { if (audio.paused) { updateActive(); drawWave(); } });
@@ -1177,6 +1223,111 @@
   });
   new ResizeObserver(() => drawWave()).observe(waveWrap);
   matchMedia("(prefers-color-scheme: light)").addEventListener("change", () => { waveColors = null; drawWave(); });
+
+  // ------------------------------------------------------------------ redaction
+  /** The current text selection if it lies inside one segment: {i, phrase, offset}. */
+  function selectionTarget() {
+    const sel = getSelection();
+    if (!sel.rangeCount || sel.isCollapsed) return null;
+    const range = sel.getRangeAt(0);
+    const a = range.startContainer.parentElement?.closest?.(".seg-text") || (range.startContainer.closest && range.startContainer.closest(".seg-text"));
+    const b = range.endContainer.parentElement?.closest?.(".seg-text") || (range.endContainer.closest && range.endContainer.closest(".seg-text"));
+    if (!a || a !== b) return null;
+    const phrase = sel.toString().replace(/\s+/g, " ").trim();
+    if (!phrase || phrase === REDACTED) return null;
+    const pre = range.cloneRange();
+    pre.selectNodeContents(a);
+    pre.setEnd(range.startContainer, range.startOffset);
+    return { i: +a.parentElement.dataset.i, phrase, offset: pre.toString().length };
+  }
+  function countEverywhere(phrase) {
+    const re = new RegExp("(?<![\\p{L}\\p{N}_])" + phrase.replace(/[.*+?^${}()|[\]\\]/g, "\\$&") + "(?![\\p{L}\\p{N}_])", "giu");
+    return S.segs.reduce((n, s) => n + (s.text.match(re) || []).length, 0);
+  }
+  function hideCtx() { $("ctxMenu").classList.add("hidden"); }
+  // Floating bar that appears as soon as text in a line is selected.
+  function hideBubble() { $("selBubble").classList.add("hidden"); }
+  function showBubble() {
+    const target = selectionTarget();
+    if (!target) { hideBubble(); return; }
+    S.ctx = target;
+    const n = countEverywhere(target.phrase);
+    $("bubAll").textContent = n > 1 ? `Everywhere (${n})` : "Everywhere";
+    $("bubAll").disabled = n < 2;
+    $("bubMute").disabled = !S.current?.has_audio;
+    const rect = getSelection().getRangeAt(0).getBoundingClientRect();
+    const b = $("selBubble");
+    b.classList.remove("hidden");
+    const bh = b.offsetHeight, bw = b.offsetWidth;
+    const below = rect.top - bh - 12 < 8;
+    b.classList.toggle("below", below);
+    b.style.left = Math.max(bw / 2 + 8, Math.min(rect.left + rect.width / 2, innerWidth - bw / 2 - 8)) + "px";
+    b.style.top = (below ? rect.bottom + 10 : rect.top - bh - 10) + "px";
+  }
+  segBox.addEventListener("mouseup", () => setTimeout(showBubble, 0));
+  segBox.addEventListener("keyup", (e) => { if (e.shiftKey || e.key === "Shift") showBubble(); else hideBubble(); });
+  document.addEventListener("selectionchange", () => { const s = getSelection(); if (!s.rangeCount || s.isCollapsed) hideBubble(); });
+  $("selBubble").addEventListener("mousedown", (e) => e.preventDefault()); // keep the selection
+  $("bubRedact").onclick = () => { hideBubble(); doRedact(S.ctx, false, false); };
+  $("bubAll").onclick = () => { hideBubble(); doRedact(S.ctx, true, false); };
+  $("bubMute").onclick = () => { hideBubble(); doRedact(S.ctx, false, true); };
+  segBox.addEventListener("scroll", hideBubble);
+  segBox.addEventListener("contextmenu", (e) => {
+    const target = selectionTarget();
+    if (!target) return; // no selection: keep the browser menu (spellcheck etc.)
+    e.preventDefault();
+    hideBubble();
+    S.ctx = target;
+    const n = countEverywhere(target.phrase);
+    $("ctxCount").textContent = n > 1 ? `${n} matches of "${target.phrase.slice(0, 30)}${target.phrase.length > 30 ? "…" : ""}"` : "only this occurrence";
+    $("ctxRedactAll").disabled = n < 2;
+    $("ctxRedactMute").disabled = !S.current?.has_audio;
+    const m = $("ctxMenu");
+    m.classList.remove("hidden");
+    const mw = m.offsetWidth, mh = m.offsetHeight;
+    m.style.left = Math.min(e.clientX, innerWidth - mw - 8) + "px";
+    m.style.top = Math.min(e.clientY, innerHeight - mh - 8) + "px";
+  });
+  document.addEventListener("mousedown", (e) => { if (!e.target.closest("#ctxMenu")) hideCtx(); });
+  document.addEventListener("wheel", hideCtx, { passive: true });
+  $("ctxRedact").onclick = () => { hideCtx(); doRedact(S.ctx, false, false); };
+  $("ctxRedactAll").onclick = () => { hideCtx(); doRedact(S.ctx, true, false); };
+  $("ctxRedactMute").onclick = () => { hideCtx(); doRedact(S.ctx, false, true); };
+  $("ctxCopy").onclick = () => { hideCtx(); navigator.clipboard?.writeText(S.ctx?.phrase || "").catch(() => document.execCommand("copy")); };
+
+  function redactSelection(everywhere, mute) {
+    const t = selectionTarget();
+    if (!t) { toast("Select the text you want to redact first"); return; }
+    doRedact(t, everywhere, mute);
+  }
+  async function doRedact(target, everywhere, mute) {
+    if (!target || !S.current) return;
+    const seg = S.segs[target.i];
+    if (!seg) return;
+    if (everywhere) {
+      const n = countEverywhere(target.phrase);
+      if (!confirm(`Redact all ${n} occurrences of "${target.phrase}"? This can't be undone.`)) return;
+    }
+    if (mute && !confirm("Also silence this part of the audio? The recording is changed permanently.")) return;
+    // capture any in-progress edit of this line before redacting on the server
+    const txt = rowEl(target.i)?.querySelector(".seg-text");
+    if (txt && document.activeElement === txt) seg.text = txt.textContent.replace(/\n/g, " ");
+    getSelection().removeAllRanges();
+    if (document.activeElement?.classList?.contains("seg-text")) document.activeElement.blur();
+    try {
+      queueSave(); await flushSave();
+      if (mute) toast("Redacting and muting audio…");
+      const r = await api(`/api/files/${S.current.id}/redact`, {
+        method: "POST",
+        body: JSON.stringify({ phrase: target.phrase, segment_id: everywhere ? null : seg.id, offset: target.offset, mute_audio: mute }),
+      });
+      S.transcript = r.transcript; S.segs = r.transcript.segments; S.speakers = r.transcript.speakers || {};
+      renderSegments(); renderSpeakers();
+      $("saveState").textContent = "All changes saved";
+      toast(`Redacted ${r.count} occurrence${r.count === 1 ? "" : "s"}${r.muted ? " and muted the audio" : ""}`);
+      if (r.muted) { const t = audio.currentTime; await loadFiles(); await loadAudio(); audio.currentTime = t; }
+    } catch (e) { toast(e.message, true); }
+  }
 
   // ------------------------------------------------------------------ teach speakers
   const PLAY_ICON = '<svg viewBox="0 0 24 24"><path d="M8 5v14l11-7z"/></svg>';
@@ -1389,6 +1540,7 @@
       const map = {
         Comma: () => seekTo(audio.currentTime - 5),
         Period: () => seekTo(audio.currentTime + 5),
+        KeyX: () => redactSelection(false, false),
         KeyN: () => nextFlag(1),
         KeyP: () => nextFlag(-1),
         KeyR: () => {

@@ -22,6 +22,7 @@ from pydantic import BaseModel
 
 import asr
 import diarize
+import redact
 import settings as cfg
 
 logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO").upper(),
@@ -583,7 +584,7 @@ async def get_transcript(fid: str) -> dict:
 
 
 SEG_KEYS = {"id", "start", "end", "text", "speaker", "words", "reviewed", "edited",
-            "confidence", "issues", "low_words", "spk_locked", "spk_conf"}
+            "confidence", "issues", "low_words", "spk_locked", "spk_conf", "redacted"}
 
 
 class TranscriptIn(BaseModel):
@@ -625,6 +626,60 @@ async def revert_transcript(fid: str) -> dict:
     write_json(d / "transcript.json", orig)
     orig.setdefault("speakers", {})
     return orig
+
+
+class RedactBody(BaseModel):
+    phrase: str
+    segment_id: Optional[int] = None  # None = every occurrence in the file
+    offset: Optional[int] = None      # character offset of the selection inside that segment
+    mute_audio: bool = False
+
+
+@app.post("/api/files/{fid}/redact")
+async def redact_text(fid: str, body: RedactBody) -> dict:
+    meta = load_meta(fid)
+    if meta["status"] in ACTIVE_STATES:
+        raise HTTPException(409, f"File is {meta['status']}, try again when it has finished")
+    phrase = body.phrase.strip()
+    if not phrase or phrase == redact.REDACTED:
+        raise HTTPException(400, "Select some text to redact")
+    d = fdir(fid)
+    t = read_json(d / "transcript.json")
+    if t is None:
+        raise HTTPException(404, "No transcript yet")
+    if body.segment_id is not None:
+        seg = next((s for s in t["segments"] if s["id"] == body.segment_id), None)
+        if seg is None:
+            raise HTTPException(404, "Segment not found")
+        spans = redact.redact_phrase(t["segments"], phrase, only=seg, near=body.offset)
+    else:
+        spans = redact.redact_phrase(t["segments"], phrase)
+    if not spans:
+        raise HTTPException(404, "That text wasn't found (it may already be redacted)")
+    t["updated"] = time.time()
+    write_json(d / "transcript.json", t)
+    # Scrub the original model output too, so "Revert edits" can't restore redacted text.
+    orig = read_json(d / "transcript.orig.json")
+    if orig is not None:
+        redact.redact_phrase(orig["segments"], phrase)
+        write_json(d / "transcript.orig.json", orig)
+    muted = False
+    if body.mute_audio and (d / "audio.mp3").exists():
+        filt = redact.mute_filter(spans)
+        tmp = d / "audio.muting.mp3"
+        code, _, err = await asr.run("ffmpeg", "-y", "-v", "error", "-i", str(d / "audio.mp3"), "-af", filt,
+                                     "-c:a", "libmp3lame", "-b:a", cfg.MP3_BITRATE, str(tmp))
+        if code != 0:
+            tmp.unlink(missing_ok=True)
+            raise HTTPException(500, f"Muting audio failed: {err.decode(errors='ignore')[-300:]}")
+        tmp.replace(d / "audio.mp3")
+        write_json(d / "peaks.json", await compute_peaks(d / "audio.mp3", meta.get("duration") or 0))
+        (d / "embeddings.json").unlink(missing_ok=True)
+        muted = True
+        update_meta(fid, audio_version=int(meta.get("audio_version") or 0) + 1)
+    log.info("redacted %d occurrence(s) in %s (audio muted: %s)", len(spans), fid, muted)
+    t.setdefault("speakers", {})
+    return {"count": len(spans), "muted": muted, "transcript": t}
 
 
 class IdentifyBody(BaseModel):

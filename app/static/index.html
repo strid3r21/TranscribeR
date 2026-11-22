@@ -87,6 +87,8 @@
           <div><kbd>Alt</kbd>+click a word to play from it</div>
           <div><kbd>Alt</kbd>+<kbd>S</kbd> split segment at cursor</div>
           <div><kbd>Backspace</kbd> at start merges with previous</div>
+          <div>Select text + right-click (or <kbd>Alt</kbd>+<kbd>X</kbd>) to redact</div>
+          <div><kbd>Esc</kbd> leave a line and resume playback</div>
         </div>
       </section>
 
@@ -142,8 +144,8 @@
             <label class="toggle" title="Keep the current segment in view while playing">
               <input type="checkbox" id="followToggle" checked><span class="switch"></span><span>Follow</span>
             </label>
-            <label class="toggle" title="Pause while you type, then resume (rewinding 1s) once you stop">
-              <input type="checkbox" id="typingToggle" checked><span class="switch"></span><span>Pause while typing</span>
+            <label class="toggle" title="Clicking into a line pauses playback; press Esc to leave the line and resume (1s back). Typing while it plays also pauses and resumes.">
+              <input type="checkbox" id="typingToggle" checked><span class="switch"></span><span>Pause while editing</span>
             </label>
           </div>
           <audio id="audio" preload="metadata"></audio>
@@ -207,6 +209,18 @@
     </div>
     <div id="spkMenuList"></div>
     <button class="spk-new" id="spkNew">+ New speaker</button>
+  </div>
+  <div class="sel-bubble hidden" id="selBubble" role="toolbar" aria-label="Redact selection">
+    <button id="bubRedact" title="Redact this (Alt+X)"><span class="bar-icon"></span>Redact</button>
+    <button id="bubAll" title="Redact every occurrence in this file">Everywhere</button>
+    <button id="bubMute" title="Redact and silence it in the audio too">+ Mute audio</button>
+  </div>
+  <div class="ctx-menu hidden" id="ctxMenu" role="menu">
+    <button id="ctxRedact" role="menuitem"><b>Redact</b><kbd>Alt+X</kbd></button>
+    <button id="ctxRedactAll" role="menuitem"><b>Redact everywhere</b><small id="ctxCount"></small></button>
+    <button id="ctxRedactMute" role="menuitem"><b>Redact and mute audio</b><small>Silences it in the recording too</small></button>
+    <div class="ctx-sep"></div>
+    <button id="ctxCopy" role="menuitem"><b>Copy</b></button>
   </div>
   <div class="modal hidden" id="trainer" role="dialog" aria-modal="true" aria-labelledby="trTitle">
     <div class="modal-card">
