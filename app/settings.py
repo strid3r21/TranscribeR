@@ -35,3 +35,14 @@ WORD_THRESHOLD = float(os.getenv("WORD_THRESHOLD", "0.45"))
 MP3_BITRATE = os.getenv("MP3_BITRATE", "128k")
 AUTO_TRANSCRIBE = _bool("AUTO_TRANSCRIBE", True)
 MAX_UPLOAD_MB = int(os.getenv("MAX_UPLOAD_MB", "4096"))
+
+# Built-in MOSS-Transcribe-Diarize engine (transcribe.cpp). The model downloads to /data/models on first use.
+LOCAL_MOSS = _bool("LOCAL_MOSS", True)
+MOSS_QUANT = os.getenv("MOSS_QUANT", "Q8_0")  # Q8_0 | Q6_K | Q5_K_M | Q4_K_M | F16
+MOSS_MODEL_PATH = os.getenv("MOSS_MODEL_PATH", "")
+MOSS_MODEL_URL = os.getenv("MOSS_MODEL_URL", "")
+MOSS_BACKEND = os.getenv("MOSS_BACKEND", "auto").lower()  # auto | vulkan | cpu
+MOSS_THREADS = int(os.getenv("MOSS_THREADS", "0"))  # 0 = all cores
+MOSS_CHUNK_SECONDS = float(os.getenv("MOSS_CHUNK_SECONDS", "600"))
+MOSS_REMOTE_MATCH = os.getenv("MOSS_REMOTE_MATCH", "moss")  # llama-swap model names treated as MOSS (regex)
+MOSS_REMOTE_CHUNK_SECONDS = float(os.getenv("MOSS_REMOTE_CHUNK_SECONDS", "600"))

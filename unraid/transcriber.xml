@@ -9,7 +9,7 @@
   <Privileged>false</Privileged>
   <Support>https://github.com/strid3r21/TranscribeR</Support>
   <Project>https://github.com/strid3r21/TranscribeR</Project>
-  <Overview>Web UI for transcribing audio through a llama-swap hosted speech-to-text model (whisper.cpp, Nemotron/llama-server audio models, faster-whisper, etc). Long files are chunked automatically, speakers are detected on the CPU and can be named. Upload audio (auto converted to MP3), follow a synced timestamped transcript while it plays, edit it inline, review segments flagged as uncertain, and export plain text, timestamped text, SRT, VTT or JSON.</Overview>
+  <Overview>Web UI for transcribing audio through a llama-swap hosted speech-to-text model (whisper.cpp, Nemotron/llama-server audio models, faster-whisper, etc), or with the built-in MOSS-Transcribe-Diarize engine (transcribes and separates speakers in one pass; GPU optional). Long files are chunked automatically, speakers are detected on the CPU and can be named. Upload audio (auto converted to MP3), follow a synced timestamped transcript while it plays, edit it inline, review segments flagged as uncertain, and export plain text, timestamped text, SRT, VTT or JSON.</Overview>
   <Category>MediaApp:Other Productivity: Tools:</Category>
   <WebUI>http://[IP]:[PORT:8000]/</WebUI>
   <TemplateURL>https://raw.githubusercontent.com/strid3r21/TranscribeR/main/unraid/transcriber.xml</TemplateURL>
@@ -20,7 +20,7 @@
   <DateInstalled/>
   <DonateText/>
   <DonateLink/>
-  <Requires>A running llama-swap instance with a transcription model configured (endpoint /v1/audio/transcriptions).</Requires>
+  <Requires>A llama-swap instance with a transcription model, or nothing at all when using the built-in MOSS engine. For GPU with MOSS: Nvidia Driver plugin, add --runtime=nvidia to Extra Parameters and set NVIDIA_VISIBLE_DEVICES.</Requires>
   <Config Name="WebUI Port" Target="8000" Default="8000" Mode="tcp" Description="Port for the web interface" Type="Port" Display="always" Required="true" Mask="false">8000</Config>
   <Config Name="Data" Target="/data" Default="/mnt/user/appdata/transcriber" Mode="rw" Description="Uploaded audio, waveforms and transcripts" Type="Path" Display="always" Required="true" Mask="false">/mnt/user/appdata/transcriber</Config>
   <Config Name="llama-swap URL" Target="LLAMA_SWAP_URL" Default="http://192.168.1.10:8080" Mode="" Description="Base URL of your llama-swap server (no trailing /v1)" Type="Variable" Display="always" Required="true" Mask="false">http://192.168.1.10:8080</Config>
@@ -39,5 +39,10 @@
   <Config Name="Request timeout" Target="REQUEST_TIMEOUT" Default="1800" Mode="" Description="Seconds to wait for one chunk" Type="Variable" Display="advanced" Required="false" Mask="false">1800</Config>
   <Config Name="Uncertainty threshold" Target="UNCERTAINTY_THRESHOLD" Default="0.70" Mode="" Description="Default segment confidence below which a segment is flagged (adjustable in UI)" Type="Variable" Display="advanced" Required="false" Mask="false">0.70</Config>
   <Config Name="Word threshold" Target="WORD_THRESHOLD" Default="0.45" Mode="" Description="Word probability below which a word is underlined" Type="Variable" Display="advanced" Required="false" Mask="false">0.45</Config>
+  <Config Name="Nvidia GPU" Target="NVIDIA_VISIBLE_DEVICES" Default="" Mode="" Description="For the built-in MOSS engine on GPU: 'all' or a GPU UUID, plus --runtime=nvidia in Extra Parameters. Empty = CPU." Type="Variable" Display="always" Required="false" Mask="false"/>
+  <Config Name="Built-in MOSS engine" Target="LOCAL_MOSS" Default="true" Mode="" Description="Offer moss-transcribe-diarize (built-in) in the model list. Model (~1 GB) downloads to /data/models on first use." Type="Variable" Display="advanced" Required="false" Mask="false">true</Config>
+  <Config Name="MOSS quantization" Target="MOSS_QUANT" Default="Q8_0" Mode="" Description="Q8_0 (best, 987 MB), Q6_K, Q5_K_M or Q4_K_M (617 MB)" Type="Variable" Display="advanced" Required="false" Mask="false">Q8_0</Config>
+  <Config Name="MOSS backend" Target="MOSS_BACKEND" Default="auto" Mode="" Description="auto (GPU via Vulkan if available), vulkan or cpu" Type="Variable" Display="advanced" Required="false" Mask="false">auto</Config>
+  <Config Name="MOSS chunk seconds" Target="MOSS_CHUNK_SECONDS" Default="600" Mode="" Description="Long audio is split at pauses into chunks this long (memory ~85 MB per minute). Chunks that run out of memory are split automatically." Type="Variable" Display="advanced" Required="false" Mask="false">600</Config>
   <Config Name="Max upload MB" Target="MAX_UPLOAD_MB" Default="4096" Mode="" Description="Upload size limit" Type="Variable" Display="advanced" Required="false" Mask="false">4096</Config>
 </Container>

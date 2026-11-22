@@ -22,6 +22,7 @@ from pydantic import BaseModel
 
 import asr
 import diarize
+import moss
 import redact
 import settings as cfg
 
@@ -240,23 +241,39 @@ async def job_transcribe(fid: str, opts: dict) -> None:
     diar_task: Optional[asyncio.Task] = None
     try:
         t0 = time.time()
-        if num_speakers is not None:  # CPU-bound; runs alongside the GPU transcription
-            diar_task = asyncio.create_task(run_diarization(fid, audio, num_speakers))
-        result = await asr.transcribe_file(audio, meta.get("duration") or 0, opts, d / "work",
-                                           lambda p: set_progress(fid, **p))
-        speakers: dict = {}
-        turns, cents = None, {}
-        if diar_task:
-            set_progress(fid, stage="speakers")
-            try:
-                turns, cents, _ = await diar_task
-            except Exception as exc:  # noqa: BLE001
-                log.exception("diarization failed for %s", fid)
-        words = asr.finalize_words(result["spans"], result["silences"], turns)
-        if turns:
-            speakers = name_from_voices(asr.assign_speakers(words, turns), cents)
+        notes: list = []
+        if moss.is_local(meta["model"]) or moss.is_remote(meta["model"]):
+            if moss.is_local(meta["model"]) and not moss.available():
+                raise RuntimeError("The built-in MOSS engine isn't available in this container")
+            # MOSS detects speakers itself (diarization models only link speakers across chunks).
+            mspk = diarize.parse_speakers(opts.get("speakers"))
+            result = await moss.transcribe_file(audio, meta.get("duration") or 0, opts, d / "work",
+                                                lambda p: set_progress(fid, **p), mspk, bool(load_voices()))
+            words, notes = result["words"], result["notes"]
+            speakers = name_from_voices(result["speakers"], result["centroids"]) if result["speakers"] else {}
+        else:
+            if num_speakers is not None:  # CPU-bound; runs alongside the GPU transcription
+                diar_task = asyncio.create_task(run_diarization(fid, audio, num_speakers))
+            result = await asr.transcribe_file(audio, meta.get("duration") or 0, opts, d / "work",
+                                               lambda p: set_progress(fid, **p))
+            speakers = {}
+            turns, cents = None, {}
+            if diar_task:
+                set_progress(fid, stage="speakers")
+                try:
+                    turns, cents, _ = await diar_task
+                except Exception as exc:  # noqa: BLE001
+                    log.exception("diarization failed for %s", fid)
+            words = asr.finalize_words(result["spans"], result["silences"], turns)
+            if turns:
+                speakers = name_from_voices(asr.assign_speakers(words, turns), cents)
         segments = asr.build_segments(words)
         asr.score_segments(segments)
+        for a, b, msg in notes:
+            for seg in segments:
+                if seg["start"] < b and seg["end"] > a:
+                    seg["issues"].append(msg)
+                    break
         redact.reapply(segments, load_redactions(d)["entries"])
         prev = read_json(d / "transcript.json") or {}
         transcript = {"model": result["model"], "api": result["api"], "created": time.time(),
@@ -425,7 +442,9 @@ async def config() -> dict:
         models = sorted(m["id"] for m in await asr.list_models())
     except Exception as exc:  # noqa: BLE001
         error = f"Could not reach llama-swap at {cfg.LLAMA_SWAP_URL}: {exc}"
-    return {"models": models, "default_model": cfg.DEFAULT_MODEL, "default_language": cfg.DEFAULT_LANGUAGE,
+    local = [moss.MODEL_ID] if moss.available() else []
+    return {"models": local + [m for m in models if m not in local], "local_models": local,
+            "remote_count": len(models), "default_model": cfg.DEFAULT_MODEL, "default_language": cfg.DEFAULT_LANGUAGE,
             "uncertainty_threshold": cfg.UNCERTAINTY_THRESHOLD, "word_threshold": cfg.WORD_THRESHOLD,
             "auto_transcribe": cfg.AUTO_TRANSCRIBE, "backend": cfg.LLAMA_SWAP_URL, "backend_error": error,
             "diarization_available": diarize.available(), "diarization_default": cfg.DIARIZATION}
@@ -799,16 +818,24 @@ async def recover_bar(fid: str, sid: int, body: RecoverBody) -> dict:
     end = min(float(meta.get("duration") or seg["end"] + 3.0), seg["end"] + 3.0)
     work = d / "work"
     work.mkdir(exist_ok=True)
-    tr = asr.Transcriber(model, await asr.resolve_api(model), cfg.DEFAULT_LANGUAGE or None, None)
-    try:
-        path = await asr.extract_chunk(d / "audio.mp3", start, end, work, f"recover{sid}")
-        words, _ = await tr.transcribe(path, start, end, [])
-    except Exception as exc:  # noqa: BLE001
-        raise HTTPException(502, f"Couldn't re-transcribe the audio: {exc}") from None
-    finally:
-        await tr.close()
-        shutil.rmtree(work, ignore_errors=True)
-    heard = "".join(w["w"] for w in words).strip()
+    if moss.is_local(model) or moss.is_remote(model):
+        try:
+            heard = (await moss.transcribe_window(d / "audio.mp3", start, end, model, work)).strip()
+        except Exception as exc:  # noqa: BLE001
+            raise HTTPException(502, f"Couldn't re-transcribe the audio: {exc}") from None
+        finally:
+            shutil.rmtree(work, ignore_errors=True)
+    else:
+        tr = asr.Transcriber(model, await asr.resolve_api(model), cfg.DEFAULT_LANGUAGE or None, None)
+        try:
+            path = await asr.extract_chunk(d / "audio.mp3", start, end, work, f"recover{sid}")
+            words, _ = await tr.transcribe(path, start, end, [])
+        except Exception as exc:  # noqa: BLE001
+            raise HTTPException(502, f"Couldn't re-transcribe the audio: {exc}") from None
+        finally:
+            await tr.close()
+            shutil.rmtree(work, ignore_errors=True)
+        heard = "".join(w["w"] for w in words).strip()
     new_text = redact.fill_bar(seg["text"], body.bar, heard) if heard else None
     if not new_text:
         raise HTTPException(422, "Couldn't find the missing words in the audio (was this part muted?)")

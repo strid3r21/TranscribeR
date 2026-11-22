@@ -1,7 +1,7 @@
 FROM python:3.12-slim
 
 RUN apt-get update \
- && apt-get install -y --no-install-recommends ffmpeg tini \
+ && apt-get install -y --no-install-recommends ffmpeg tini libvulkan1 libglvnd0 libegl1 libx11-6 libxext6 \
  && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
@@ -14,7 +14,10 @@ RUN python /tmp/fetch_models.py /opt/models && rm /tmp/fetch_models.py
 
 COPY app/ /app/
 
+# libvulkan1 lets the built-in MOSS engine use an Nvidia/AMD/Intel GPU when one is passed in
+# (Unraid: --runtime=nvidia, NVIDIA_VISIBLE_DEVICES, NVIDIA_DRIVER_CAPABILITIES=all); otherwise it runs on CPU.
 ENV DATA_DIR=/data \
+    NVIDIA_DRIVER_CAPABILITIES=all \
     MODELS_DIR=/opt/models \
     PORT=8000 \
     PYTHONUNBUFFERED=1

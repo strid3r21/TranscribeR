@@ -4,3 +4,4 @@ httpx==0.28.1
 python-multipart==0.0.34
 numpy==2.3.4
 sherpa-onnx==2.0.2
+transcribe-cpp==0.4.2

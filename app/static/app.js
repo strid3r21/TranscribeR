@@ -109,7 +109,8 @@
       const models = c.models.length ? c.models.slice() : [c.default_model];
       if (saved && !models.includes(saved)) models.unshift(saved);
       sel.innerHTML = "";
-      for (const m of models) sel.append(new Option(m, m, false, m === saved));
+      const local = new Set(c.local_models || []);
+      for (const m of models) sel.append(new Option(local.has(m) ? `${m} (built-in)` : m, m, false, m === saved));
       $("languageInput").value = store.get("language", c.default_language || "");
       $("autoToggle").checked = store.get("auto", c.auto_transcribe);
       $("speakersField").classList.toggle("hidden", !c.diarization_available);
@@ -119,11 +120,11 @@
       $("thresholdVal").textContent = Math.round(S.threshold * 100) + "%";
       if (c.backend_error) {
         status.className = "backend err";
-        status.querySelector(".label").textContent = "llama-swap unreachable";
+        status.querySelector(".label").textContent = (c.local_models || []).length ? "llama-swap unreachable · built-in OK" : "llama-swap unreachable";
         status.title = c.backend_error;
       } else {
         status.className = "backend ok";
-        status.querySelector(".label").textContent = `llama-swap · ${c.models.length} models`;
+        status.querySelector(".label").textContent = `llama-swap · ${c.remote_count ?? c.models.length} models`;
         status.title = c.backend;
       }
     } catch (e) {
@@ -416,9 +417,10 @@
       if (p.label) detail += ` · ${p.label}`;
       else if (p.stage === "speakers") detail += " · matching speakers to text";
       else if (p.eta != null && p.done < p.total) detail += ` · about ${fmt(p.eta)} left`;
-      else if (!p.done) detail += " · llama-swap may need to load the model first";
+      else if (!p.done) detail += (S.config?.local_models || []).includes(f.model) ? " · loading the model" : " · llama-swap may need to load the model first";
       $("procDetail").textContent = detail;
-      if (p.total) addBar(bars, "Transcription", p.done / p.total, `${p.done}/${p.total}`);
+      if (p.download != null) addBar(bars, "Model download", p.download, Math.round(p.download * 100) + "%");
+      if (p.total) addBar(bars, "Transcription", p.done / p.total, `${Math.floor(p.done)}/${p.total}`);
     }
     if (p.speakers != null) addBar(bars, "Speakers", p.speakers, Math.round(p.speakers * 100) + "%");
   }

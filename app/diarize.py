@@ -161,8 +161,12 @@ def cluster_centroids(samples, turns, per_cluster: int = 10) -> dict:
     return out
 
 
-def merge_clusters(samples, turns, min_share: float = 0.02) -> list[tuple[float, float, int]]:
-    """Merge clusters that are the same voice; fold clusters with < min_share of talk time into the nearest."""
+def merge_clusters(samples, turns, min_share: float = 0.02,
+                   target: Optional[int] = None) -> list[tuple[float, float, int]]:
+    """Merge clusters that are the same voice; fold clusters with < min_share of talk time into the nearest.
+
+    With `target`, keep merging the most similar voices until at most `target` remain (no folding).
+    """
     import numpy as np
 
     cents = cluster_centroids(samples, turns, per_cluster=6)
@@ -188,20 +192,20 @@ def merge_clusters(samples, turns, min_share: float = 0.02) -> list[tuple[float,
         sim = m @ m.T
         np.fill_diagonal(sim, -1)
         i, j = np.unravel_index(int(np.argmax(sim)), sim.shape)
-        if sim[i, j] < SAME_VOICE:
+        if sim[i, j] < SAME_VOICE and (target is None or len(vec) <= target):
             break
         a, b = keys[i], keys[j]
         merge(a, b) if secs[a] >= secs[b] else merge(b, a)
 
-    while len(vec) > 1:  # fold tiny / unembeddable clusters into their nearest voice
+    while len(vec) > (target or 1):  # fold tiny / unembeddable clusters into their nearest voice
         small = min(vec, key=lambda k: secs[k])
-        if secs[small] / total >= min_share and vec[small] is not None:
+        if (target is None and secs[small] / total >= min_share) and vec[small] is not None:
             break
         others = [k for k in vec if k != small and vec[k] is not None]
         if not others:
             break
-        target = max(others, key=lambda k: float(vec[small] @ vec[k]) if vec[small] is not None else secs[k])
-        merge(target, small)
+        dest = max(others, key=lambda k: float(vec[small] @ vec[k]) if vec[small] is not None else secs[k])
+        merge(dest, small)
 
     relabel = {}
     for new, (rep, members) in enumerate(sorted(groups.items(), key=lambda kv: -secs[kv[0]])):

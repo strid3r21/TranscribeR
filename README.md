@@ -1,6 +1,6 @@
 # TranscribeR
 
-A self-hosted web front end for speech-to-text models served through [llama-swap](https://github.com/mostlygeek/llama-swap). It's built to run as a Docker container on Unraid.
+A self-hosted web front end for speech-to-text models served through [llama-swap](https://github.com/mostlygeek/llama-swap), with a built-in [MOSS-Transcribe-Diarize](https://huggingface.co/handy-computer/moss-transcribe-diarize-gguf) engine that transcribes and separates speakers in one pass. It's built to run as a Docker container on Unraid.
 
 - **Upload anything ffmpeg can read** (drag and drop, multiple files, video too). Files that aren't already MP3 are converted to constant-bitrate MP3 so seeking in the browser lands on the right spot.
 - **File library** with status and duration. Rename files, delete them one at a time or in bulk, or delete just the audio to free space while keeping the transcript.
@@ -45,6 +45,61 @@ Diarization uses [sherpa-onnx](https://github.com/k2-fsa/sherpa-onnx) with the p
 **Teach it who's who.** Click **Teach** in the Speakers panel, name the people in the file, play a few short clips and tag who's talking (2–3 per person is usually plenty). TranscribeR compares every line's voice fingerprint (TitaNet embedding) to your examples and relabels the whole file. Any line you later fix with the speaker menu counts as another example. Click **Update all from my corrections** to re-run. Lines where it can't tell are added to *Needs review*.
 
 **Remembered voices.** With *Remember these voices* on, each person's voice is saved to `/data/voices.json`. Future files are labeled with their names automatically, and a remembered person needs no tagged clips in Teach.
+
+### MOSS-Transcribe-Diarize (transcription + speakers in one pass)
+
+[MOSS-Transcribe-Diarize](https://huggingface.co/handy-computer/moss-transcribe-diarize-gguf) (0.9B, English and Chinese) writes the transcript *and* who said it, with real start/end times for every turn. It runs on [transcribe.cpp](https://github.com/handy-computer/transcribe.cpp), not llama-server, so there are two ways to use it:
+
+**Built in (simplest).** Pick **moss-transcribe-diarize (built-in)** in the model dropdown. The model (Q8_0, about 1 GB) downloads to `/data/models` the first time. It uses the GPU through Vulkan when the container can see one, and the CPU otherwise:
+
+- About 45× real time on an RTX 4070 (warm), so a 42-minute file takes about 2½ minutes.
+- About 3× real time on a 12-core CPU.
+
+The model is loaded only while a job runs, so it doesn't hold GPU memory between jobs. On Unraid with the Nvidia Driver plugin, give the container a GPU: add `--runtime=nvidia` to *Extra Parameters* and set `NVIDIA_VISIBLE_DEVICES` to `all` or a GPU UUID.
+
+**Through llama-swap.** `app/moss_server.py` is a tiny OpenAI-compatible server (`/v1/audio/transcriptions`, `/v1/models`, `/health`) that llama-swap can start and stop like any other model. Requirements:
+
+- It needs Python 3, `pip install transcribe-cpp numpy`, and ffmpeg wherever llama-swap runs its commands. The TranscribeR image already has all three.
+- Any llama-swap model whose name contains `moss` is treated as MOSS. Change that pattern with `MOSS_REMOTE_MATCH`.
+
+Example `config.yaml` entry when llama-swap can run Python directly:
+
+```yaml
+models:
+  "moss-diarize":
+    cmd: >
+      python3 /models/moss/moss_server.py
+      --host 127.0.0.1 --port ${PORT}
+      --model /models/moss/MOSS-Transcribe-Diarize-Q8_0.gguf
+      --name moss-diarize
+    checkEndpoint: /health
+    ttl: 300
+```
+
+Or, if llama-swap can launch Docker containers (Docker CLI and `/var/run/docker.sock` available to it), run the server from the TranscribeR image:
+
+```yaml
+models:
+  "moss-diarize":
+    cmd: >
+      docker run --rm --name moss-diarize --runtime=nvidia -e NVIDIA_VISIBLE_DEVICES=all
+      -p ${PORT}:9000 -v /mnt/user/models/moss:/models:ro
+      ghcr.io/strid3r21/transcriber:latest
+      python /app/moss_server.py --port 9000 --name moss-diarize
+      --model /models/MOSS-Transcribe-Diarize-Q8_0.gguf
+    cmdStop: docker stop moss-diarize
+    proxy: http://127.0.0.1:${PORT}
+    checkEndpoint: /health
+    ttl: 300
+```
+
+Both ways work the same:
+
+- Long audio is cut at pauses into ~10-minute chunks. Memory grows by about 85 MB per minute of audio, and a chunk that runs out of memory is split and retried.
+- MOSS numbers speakers per request, so speakers are linked across chunks by voice (TitaNet), and a fixed speaker count is honored.
+- Teach and remembered voices work as usual.
+- MOSS doesn't report word probabilities, so files transcribed with it only get the repetition/hallucination flags.
+- Word times inside a turn are estimated.
 
 ## Install on Unraid
 
@@ -94,6 +149,14 @@ See `docker-compose.yml` for the same setup as a compose file.
 | `WORD_THRESHOLD` | `0.45` | Words below this probability get underlined |
 | `MP3_BITRATE` | `128k` | Bitrate for converted files |
 | `MAX_UPLOAD_MB` | `4096` | Upload limit |
+| `LOCAL_MOSS` | `true` | Offer the built-in MOSS-Transcribe-Diarize engine |
+| `MOSS_QUANT` | `Q8_0` | Which GGUF to download: `Q8_0`, `Q6_K`, `Q5_K_M`, `Q4_K_M`, `F16` |
+| `MOSS_MODEL_PATH` / `MOSS_MODEL_URL` | – | Use your own GGUF file / download URL |
+| `MOSS_BACKEND` | `auto` | `auto` (Vulkan GPU if present), `vulkan` or `cpu` |
+| `MOSS_THREADS` | `0` | CPU threads for MOSS (0 = all) |
+| `MOSS_CHUNK_SECONDS` | `600` | Chunk length for the built-in engine |
+| `MOSS_REMOTE_MATCH` | `moss` | llama-swap model names (regex) that speak MOSS's format |
+| `MOSS_REMOTE_CHUNK_SECONDS` | `600` | Chunk length for MOSS through llama-swap |
 | `PORT` | `8000` | Port inside the container |
 
 Data is stored as plain files in `/data/files/<id>/`: `audio.mp3`, `peaks.json`, `transcript.json` (your edits), `transcript.orig.json` (the original model output, used by "Revert edits") and `meta.json`. There's no database.
