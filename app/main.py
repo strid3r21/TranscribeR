@@ -257,6 +257,7 @@ async def job_transcribe(fid: str, opts: dict) -> None:
             speakers = name_from_voices(asr.assign_speakers(words, turns), cents)
         segments = asr.build_segments(words)
         asr.score_segments(segments)
+        redact.reapply(segments, load_redactions(d)["entries"])
         prev = read_json(d / "transcript.json") or {}
         transcript = {"model": result["model"], "api": result["api"], "created": time.time(),
                       "markers": prev.get("markers") or [],
@@ -502,7 +503,7 @@ async def delete_audio(fid: str) -> dict:
     if meta["status"] in ACTIVE_STATES:
         raise HTTPException(409, f"File is {meta['status']}, try again when it has finished")
     d = fdir(fid)
-    for name in ("audio.mp3", "peaks.json", meta.get("original_file") or ""):
+    for name in ("audio.mp3", "audio.original.mp3", "peaks.json", meta.get("original_file") or ""):
         if name:
             (d / name).unlink(missing_ok=True)
     return public_meta(update_meta(fid, audio_deleted=True, size=0))
@@ -581,9 +582,7 @@ async def get_transcript(fid: str) -> dict:
     t = read_json(fdir(fid) / "transcript.json")
     if t is None:
         raise HTTPException(404, "No transcript yet")
-    t.setdefault("speakers", {})
-    t.setdefault("markers", [])
-    return t
+    return with_redactions(fdir(fid), t)
 
 
 SEG_KEYS = {"id", "start", "end", "text", "speaker", "words", "reviewed", "edited",
@@ -642,6 +641,13 @@ async def save_transcript(fid: str, body: TranscriptIn) -> dict:
                          for k, v in body.speakers.items()}
     t["updated"] = time.time()
     write_json(path, t)
+    d = fdir(fid)
+    store = load_redactions(d)
+    gone = set(store["entries"]) - redact.token_ids(t["segments"])
+    for rid in gone:  # the user deleted the bar: treat it as erased
+        await _erase(fid, d, t, store, rid)
+    if gone:
+        save_redactions(d, store)
     return {"ok": True, "updated": t["updated"]}
 
 
@@ -652,9 +658,9 @@ async def revert_transcript(fid: str) -> dict:
     if orig is None:
         raise HTTPException(404, "No original transcript")
     orig["markers"] = (read_json(d / "transcript.json") or {}).get("markers") or []
+    redact.reapply(orig["segments"], load_redactions(d)["entries"])
     write_json(d / "transcript.json", orig)
-    orig.setdefault("speakers", {})
-    return orig
+    return with_redactions(d, orig)
 
 
 class RedactBody(BaseModel):
@@ -664,51 +670,146 @@ class RedactBody(BaseModel):
     mute_audio: bool = False
 
 
-@app.post("/api/files/{fid}/redact")
-async def redact_text(fid: str, body: RedactBody) -> dict:
+def load_redactions(d: Path) -> dict:
+    store = read_json(d / "redactions.json", {}) or {}
+    store.setdefault("entries", {})
+    return store
+
+
+def save_redactions(d: Path, store: dict) -> None:
+    write_json(d / "redactions.json", store)
+
+
+def with_redactions(d: Path, t: dict) -> dict:
+    """Transcript payload for the browser: redaction ids/flags only, never the hidden text."""
+    store = load_redactions(d)
+    t = dict(t)
+    t.setdefault("speakers", {})
+    t.setdefault("markers", [])
+    t["redactions"] = {rid: {"muted": bool(e.get("muted"))} for rid, e in store["entries"].items()}
+    return t
+
+
+async def _encode(src: Path, dest: Path, spans: list) -> None:
+    filt = redact.mute_filter(spans)
+    tmp = dest.with_name(dest.stem + ".building.mp3")
+    args = ["ffmpeg", "-y", "-v", "error", "-i", str(src)] + (["-af", filt] if filt else []) + \
+           ["-c:a", "libmp3lame", "-b:a", cfg.MP3_BITRATE, str(tmp)]
+    code, _, err = await asr.run(*args)
+    if code != 0:
+        tmp.unlink(missing_ok=True)
+        raise HTTPException(500, f"Audio processing failed: {err.decode(errors='ignore')[-300:]}")
+    tmp.replace(dest)
+
+
+async def rebuild_audio(fid: str, d: Path, store: dict) -> bool:
+    """audio.mp3 = untouched backup with every currently-muted redaction silenced."""
+    backup = d / "audio.original.mp3"
+    if not backup.exists() or not (d / "audio.mp3").exists():
+        return False
+    spans = [e["span"] for e in store["entries"].values() if e.get("muted")]
+    if spans:
+        await _encode(backup, d / "audio.mp3", spans)
+    else:
+        shutil.copyfile(backup, d / "audio.mp3")
+    meta = load_meta(fid)
+    write_json(d / "peaks.json", await compute_peaks(d / "audio.mp3", meta.get("duration") or 0))
+    (d / "embeddings.json").unlink(missing_ok=True)
+    update_meta(fid, audio_version=int(meta.get("audio_version") or 0) + 1)
+    return True
+
+
+def _editable(fid: str) -> tuple[Path, dict]:
     meta = load_meta(fid)
     if meta["status"] in ACTIVE_STATES:
         raise HTTPException(409, f"File is {meta['status']}, try again when it has finished")
-    phrase = body.phrase.strip()
-    if not phrase or phrase == redact.REDACTED:
-        raise HTTPException(400, "Select some text to redact")
     d = fdir(fid)
     t = read_json(d / "transcript.json")
     if t is None:
         raise HTTPException(404, "No transcript yet")
+    return d, t
+
+
+@app.post("/api/files/{fid}/redact")
+async def redact_text(fid: str, body: RedactBody) -> dict:
+    d, t = _editable(fid)
+    phrase = body.phrase.strip()
+    if not phrase or redact.TOKEN_RE.fullmatch(phrase):
+        raise HTTPException(400, "Select some text to redact")
     if body.segment_id is not None:
         seg = next((s for s in t["segments"] if s["id"] == body.segment_id), None)
         if seg is None:
             raise HTTPException(404, "Segment not found")
-        spans = redact.redact_phrase(t["segments"], phrase, only=seg, near=body.offset)
+        done = redact.redact_phrase(t["segments"], phrase, only=seg, near=body.offset)
     else:
-        spans = redact.redact_phrase(t["segments"], phrase)
-    if not spans:
+        done = redact.redact_phrase(t["segments"], phrase)
+    if not done:
         raise HTTPException(404, "That text wasn't found (it may already be redacted)")
+    store = load_redactions(d)
+    mute = body.mute_audio and (d / "audio.mp3").exists()
+    for r in done:
+        store["entries"][r["id"]] = {"text": r["text"], "span": r["span"], "seg_start": r["seg_start"],
+                                     "muted": mute, "created": time.time()}
+    if mute and not (d / "audio.original.mp3").exists():
+        shutil.copyfile(d / "audio.mp3", d / "audio.original.mp3")  # untouched copy, so muting is reversible
     t["updated"] = time.time()
     write_json(d / "transcript.json", t)
-    # Scrub the original model output too, so "Revert edits" can't restore redacted text.
+    save_redactions(d, store)
+    muted = await rebuild_audio(fid, d, store) if mute else False
+    log.info("redacted %d occurrence(s) in %s (audio muted: %s)", len(done), fid, muted)
+    return {"count": len(done), "muted": muted, "transcript": with_redactions(d, t)}
+
+
+@app.post("/api/files/{fid}/redactions/{rid}/unredact")
+async def unredact_text(fid: str, rid: str) -> dict:
+    d, t = _editable(fid)
+    store = load_redactions(d)
+    entry = store["entries"].get(rid)
+    if entry is None:
+        raise HTTPException(404, "This redaction was erased permanently and can't be undone")
+    redact.unredact(t["segments"], rid, entry["text"])
+    del store["entries"][rid]
+    t["updated"] = time.time()
+    write_json(d / "transcript.json", t)
+    save_redactions(d, store)
+    unmuted = await rebuild_audio(fid, d, store) if entry.get("muted") else False
+    return {"unmuted": unmuted, "transcript": with_redactions(d, t)}
+
+
+async def _erase(fid: str, d: Path, t: dict, store: dict, rid: str) -> None:
+    entry = store["entries"].pop(rid, None)
+    redact.finalize(t["segments"], rid)
+    if entry is None:
+        return
     orig = read_json(d / "transcript.orig.json")
-    if orig is not None:
-        redact.redact_phrase(orig["segments"], phrase)
+    if orig is not None:  # so Revert can't bring it back
+        redact.scrub(orig["segments"], entry["text"])
         write_json(d / "transcript.orig.json", orig)
-    muted = False
-    if body.mute_audio and (d / "audio.mp3").exists():
-        filt = redact.mute_filter(spans)
-        tmp = d / "audio.muting.mp3"
-        code, _, err = await asr.run("ffmpeg", "-y", "-v", "error", "-i", str(d / "audio.mp3"), "-af", filt,
-                                     "-c:a", "libmp3lame", "-b:a", cfg.MP3_BITRATE, str(tmp))
-        if code != 0:
-            tmp.unlink(missing_ok=True)
-            raise HTTPException(500, f"Muting audio failed: {err.decode(errors='ignore')[-300:]}")
-        tmp.replace(d / "audio.mp3")
-        write_json(d / "peaks.json", await compute_peaks(d / "audio.mp3", meta.get("duration") or 0))
-        (d / "embeddings.json").unlink(missing_ok=True)
-        muted = True
-        update_meta(fid, audio_version=int(meta.get("audio_version") or 0) + 1)
-    log.info("redacted %d occurrence(s) in %s (audio muted: %s)", len(spans), fid, muted)
-    t.setdefault("speakers", {})
-    return {"count": len(spans), "muted": muted, "transcript": t}
+    backup = d / "audio.original.mp3"
+    if entry.get("muted") and backup.exists():  # bake the silence into the backup too
+        await _encode(backup, backup, [entry["span"]])
+
+
+@app.post("/api/files/{fid}/redactions/{rid}/erase")
+async def erase_redaction(fid: str, rid: str) -> dict:
+    d, t = _editable(fid)
+    store = load_redactions(d)
+    await _erase(fid, d, t, store, rid)
+    write_json(d / "transcript.json", t)
+    save_redactions(d, store)
+    return {"transcript": with_redactions(d, t)}
+
+
+@app.post("/api/files/{fid}/redactions/erase-all")
+async def erase_all_redactions(fid: str) -> dict:
+    d, t = _editable(fid)
+    store = load_redactions(d)
+    ids = list(store["entries"]) + list(redact.token_ids(t["segments"]) - set(store["entries"]))
+    for rid in ids:
+        await _erase(fid, d, t, store, rid)
+    write_json(d / "transcript.json", t)
+    save_redactions(d, store)
+    return {"count": len(ids), "transcript": with_redactions(d, t)}
 
 
 class IdentifyBody(BaseModel):
@@ -776,7 +877,7 @@ def ts(sec: float, sep: str = ".", ms: bool = True) -> str:
 
 
 def render_export(t: dict, fmt: str) -> tuple[str, str, str]:
-    segs = [s for s in t["segments"] if s["text"].strip()]
+    segs = [{**s, "text": redact.plain(s["text"])} for s in t["segments"] if s["text"].strip()]
     names = {k: v.get("name") or k for k, v in (t.get("speakers") or {}).items()}
     markers = sorted(t.get("markers") or [], key=lambda m: m["t"])
 

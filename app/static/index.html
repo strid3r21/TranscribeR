@@ -117,7 +117,8 @@
               <button class="btn icon" id="moreBtn" title="More">⋯</button>
               <div class="menu-pop right" id="moreMenu">
                 <button id="diarizeBtn"><b>Detect speakers again</b><small>Keeps your text edits; uses the Speakers setting</small></button>
-                <button id="revertBtn"><b>Revert edits</b><small>Restore the original model output</small></button>
+                <button id="revertBtn"><b>Revert edits</b><small>Restore the original model output (redactions stay)</small></button>
+                <button id="eraseAllBtn"><b>Erase all redactions permanently</b><small>Do this before sharing. Redactions can't be undone after</small></button>
                 <button id="deleteAudioBtn"><b>Delete audio only</b><small>Free up space, keep the transcript</small></button>
                 <button id="deleteBtn" class="danger"><b>Delete file</b><small>Removes audio and transcript</small></button>
               </div>
@@ -224,6 +225,11 @@
     <button id="bubRedact" title="Redact this (Alt+X)"><span class="bar-icon"></span>Redact</button>
     <button id="bubAll" title="Redact every occurrence in this file">Everywhere</button>
     <button id="bubMute" title="Redact and silence it in the audio too">+ Mute audio</button>
+  </div>
+  <div class="ctx-menu hidden" id="redMenu" role="menu">
+    <div class="red-info" id="redInfo"></div>
+    <button id="redUndo" role="menuitem"><b>Unredact</b><small id="redUndoSub">Restore the original text</small></button>
+    <button id="redErase" role="menuitem" class="danger"><b>Erase permanently</b><small>Can't be undone. Removes the hidden original</small></button>
   </div>
   <div class="ctx-menu hidden" id="ctxMenu" role="menu">
     <button id="ctxRedact" role="menuitem"><b>Redact</b><kbd>Alt+X</kbd></button>

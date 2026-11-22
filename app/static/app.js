@@ -437,7 +437,7 @@
   $("transcribeBtn").onclick = async () => {
     const f = S.current;
     if (!f) return;
-    if (f.has_transcript && !confirm("Re-transcribe this file? Your current transcript and any edits will be replaced.")) return;
+    if (f.has_transcript && !confirm("Re-transcribe this file? Your current transcript and any edits will be replaced. Undoable redactions are re-applied; permanently erased text may reappear unless its audio was muted.")) return;
     try {
       await flushSave();
       S.current = await api(`/api/files/${f.id}/transcribe`, { method: "POST", body: JSON.stringify(transcribeOpts()) });
@@ -658,25 +658,30 @@
   }
 
   const REDACTED = "[REDACTED]";
-  /** Wrap every [REDACTED] marker in an atomic, non-editable bar. */
+  const TOKEN_RE = /\[REDACTED(?::([a-z0-9]{6,16}))?\]/g;
+  const isToken = (s) => /^\[REDACTED(?::[a-z0-9]{6,16})?\]$/.test(s);
+  /** Wrap every redaction token in an atomic, non-editable bar (the token text stays in the DOM, hidden). */
   function markRedactions(node) {
-    if (!node.textContent.includes(REDACTED)) return;
+    if (!node.textContent.includes("[REDACTED")) return;
     const walker = document.createTreeWalker(node, NodeFilter.SHOW_TEXT);
     const texts = [];
     let t;
-    while ((t = walker.nextNode())) if (t.data.includes(REDACTED) && !t.parentElement.classList.contains("redacted")) texts.push(t);
+    while ((t = walker.nextNode())) if (t.data.includes("[REDACTED") && !t.parentElement.classList.contains("redacted")) texts.push(t);
     for (const tn of texts) {
-      const parts = tn.data.split(REDACTED);
       const frag = document.createDocumentFragment();
-      parts.forEach((p, k) => {
-        if (p) frag.append(document.createTextNode(p));
-        if (k < parts.length - 1) {
-          const bar = el("span", "redacted", REDACTED);
-          bar.contentEditable = "false";
-          bar.title = "Redacted";
-          frag.append(bar);
-        }
-      });
+      let pos = 0;
+      for (const m of tn.data.matchAll(TOKEN_RE)) {
+        if (m.index > pos) frag.append(document.createTextNode(tn.data.slice(pos, m.index)));
+        const rid = m[1];
+        const live = rid && S.transcript?.redactions?.[rid];
+        const bar = el("span", "redacted" + (live ? "" : " final"), m[0]);
+        bar.contentEditable = "false";
+        if (live) { bar.dataset.rid = rid; bar.title = "Redacted · click to unredact or erase"; }
+        else bar.title = "Permanently redacted";
+        frag.append(bar);
+        pos = m.index + m[0].length;
+      }
+      if (pos < tn.data.length) frag.append(document.createTextNode(tn.data.slice(pos)));
       tn.replaceWith(frag);
     }
   }
@@ -1402,12 +1407,60 @@
     const b = range.endContainer.parentElement?.closest?.(".seg-text") || (range.endContainer.closest && range.endContainer.closest(".seg-text"));
     if (!a || a !== b) return null;
     const phrase = sel.toString().replace(/\s+/g, " ").trim();
-    if (!phrase || phrase === REDACTED) return null;
+    if (!phrase || isToken(phrase)) return null;
     const pre = range.cloneRange();
     pre.selectNodeContents(a);
     pre.setEnd(range.startContainer, range.startOffset);
     return { i: +a.parentElement.dataset.i, phrase, offset: pre.toString().length };
   }
+  // ---- clicking a redaction bar: unredact / erase
+  let redTarget = null;
+  function hideRedMenu() { $("redMenu").classList.add("hidden"); redTarget = null; }
+  segBox.addEventListener("mousedown", (e) => {
+    const bar = e.target.closest(".redacted[data-rid]");
+    if (!bar) return;
+    e.preventDefault(); // don't start editing / selecting
+    hideBubble(); hideCtx();
+    redTarget = bar.dataset.rid;
+    const info = S.transcript?.redactions?.[redTarget] || {};
+    $("redInfo").textContent = info.muted ? "Redacted text · audio muted" : "Redacted text";
+    $("redUndoSub").textContent = info.muted ? "Restore the original text and audio" : "Restore the original text";
+    const m = $("redMenu");
+    m.classList.remove("hidden");
+    const r = bar.getBoundingClientRect(), mw = m.offsetWidth, mh = m.offsetHeight;
+    m.style.left = Math.max(8, Math.min(r.left, innerWidth - mw - 8)) + "px";
+    m.style.top = (r.bottom + mh + 8 > innerHeight ? r.top - mh - 6 : r.bottom + 6) + "px";
+  });
+  document.addEventListener("mousedown", (e) => { if (!e.target.closest("#redMenu") && !e.target.closest(".redacted[data-rid]")) hideRedMenu(); });
+  document.addEventListener("wheel", hideRedMenu, { passive: true });
+  async function redactionAction(path, okMsg) {
+    try {
+      queueSave(); await flushSave();
+      const r = await api(`/api/files/${S.current.id}/${path}`, { method: "POST" });
+      S.transcript = r.transcript; S.segs = r.transcript.segments; S.speakers = r.transcript.speakers || {}; S.markers = r.transcript.markers || S.markers;
+      renderSegments(); renderSpeakers();
+      toast(okMsg(r));
+      if (r.unmuted) { const t = audio.currentTime; await loadFiles(); await loadAudio(); audio.currentTime = t; }
+    } catch (e) { toast(e.message, true); }
+  }
+  $("redUndo").onclick = () => {
+    const rid = redTarget; hideRedMenu();
+    if (rid) redactionAction(`redactions/${rid}/unredact`, (r) => r.unmuted ? "Unredacted (text and audio restored)" : "Unredacted");
+  };
+  $("redErase").onclick = () => {
+    const rid = redTarget; hideRedMenu();
+    if (rid && confirm("Erase this redaction permanently? The original text is destroyed and it can never be unredacted.")) {
+      redactionAction(`redactions/${rid}/erase`, () => "Redaction erased permanently");
+    }
+  };
+  $("eraseAllBtn").onclick = () => {
+    const n = Object.keys(S.transcript?.redactions || {}).length;
+    if (!n) { toast("There are no undoable redactions in this file"); return; }
+    if (confirm(`Erase all ${n} redaction${n > 1 ? "s" : ""} permanently? The hidden original text (and muted audio) is destroyed and can never be restored.`)) {
+      redactionAction("redactions/erase-all", (r) => `${r.count} redaction${r.count === 1 ? "" : "s"} erased permanently`);
+    }
+  };
+
   function countEverywhere(phrase) {
     const re = new RegExp("(?<![\\p{L}\\p{N}_])" + phrase.replace(/[.*+?^${}()|[\]\\]/g, "\\$&") + "(?![\\p{L}\\p{N}_])", "giu");
     return S.segs.reduce((n, s) => n + (s.text.match(re) || []).length, 0);
@@ -1701,7 +1754,7 @@
   // ------------------------------------------------------------------ keyboard
   document.addEventListener("keydown", (e) => {
     const inField = e.target.closest("input, select, [contenteditable=true]");
-    if (e.key === "Escape") { hideSpkMenu(); if (S.tr) closeTrainer(); }
+    if (e.key === "Escape") { hideSpkMenu(); hideRedMenu(); if (S.tr) closeTrainer(); }
     if ((e.ctrlKey || e.metaKey) && e.code === "Space") { e.preventDefault(); togglePlay(); return; }
     if (e.code === "Space" && !inField) { e.preventDefault(); togglePlay(); return; }
     if (e.altKey && !e.ctrlKey && !e.metaKey) {
