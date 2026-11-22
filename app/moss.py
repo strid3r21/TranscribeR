@@ -114,6 +114,18 @@ def parse_markers(text: str) -> list[tuple[float, float, int, str]]:
     return [(float(a), float(b), int(spk), t.strip()) for a, spk, t, b in MARKER_RE.findall(text or "") if t.strip()]
 
 
+_BG: set = set()
+_LIVE: set = set()  # running built-in sessions, so a stop request can abort them
+
+
+def cancel_all() -> None:
+    for s in list(_LIVE):
+        try:
+            s.cancel()
+        except Exception:  # noqa: BLE001
+            pass
+
+
 class _Local:
     """Built-in engine. Loaded for the duration of a job (frees GPU memory for llama-swap afterwards)."""
 
@@ -146,14 +158,20 @@ class _Local:
         if opts["vocabulary"] and self.model.supports("vocabulary"):
             kw["vocabulary"] = opts["vocabulary"]
         note = None
+        pcm = _pcm(audio, a, b)
         with self.model.session(n_threads=cfg.MOSS_THREADS) as s:
+            _LIVE.add(s)
             try:
-                segs = s.run(_pcm(audio, a, b), **kw).segments
+                segs = s.run(pcm, **kw).segments
+            except tc.Aborted:
+                raise asyncio.CancelledError() from None
             except tc.OutOfMemory as exc:
                 raise ChunkTooBig(str(exc)) from None
             except tc.OutputTruncated as exc:  # includes OutputRepetition
                 part = getattr(exc, "partial_result", None)
                 segs, note = (part.segments if part else ()), TRUNCATED_NOTE
+            finally:
+                _LIVE.discard(s)
         return [(sg.t0_ms / 1000.0, sg.t1_ms / 1000.0, max(0, sg.speaker_id), sg.text.strip()) for sg in segs], note
 
     async def start(self) -> None:
@@ -165,14 +183,35 @@ class _Local:
             raise
 
     async def run(self, audio: Path, a: float, b: float, work_dir: Path, opts: dict):
-        return await asyncio.get_running_loop().run_in_executor(None, self._run, audio, a, b, opts)
+        fut = asyncio.get_running_loop().run_in_executor(None, self._run, audio, a, b, opts)
+        try:
+            return await asyncio.shield(fut)
+        except asyncio.CancelledError:
+            # Abort the native run. It notices at its next checkpoint (on CPU the audio encoder can
+            # take a minute), so don't make the user wait: close() keeps the engine lock until it ends.
+            cancel_all()
+            self._pending = fut
+            raise
 
     async def close(self) -> None:
+        pending = getattr(self, "_pending", None)
         try:
             if self.model is not None:
-                self.model.close()
+                self.model.close()  # safe mid-run: the native free waits for the in-flight call
         finally:
-            _alock.release()
+            if pending is not None and not pending.done():
+                async def release_later():
+                    try:
+                        await pending
+                    except BaseException:  # noqa: BLE001
+                        pass
+                    finally:
+                        _alock.release()
+                        log.info("stopped MOSS run has finished unwinding")
+                _BG.add(t := asyncio.create_task(release_later()))
+                t.add_done_callback(_BG.discard)
+            else:
+                _alock.release()
 
     @property
     def label(self) -> str:

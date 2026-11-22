@@ -475,3 +475,26 @@ input[type=range] { accent-color: var(--accent); }
 .dev-gpu { color: #3fb950; }
 .dev-cpu { color: #d29922; }
 .dev-llamaswap { color: var(--muted, #8b949e); }
+.stop-btn { align-self: center; flex: none; padding: 7px 14px; border-radius: 10px; border: 1px solid var(--danger, #e5534b); background: transparent; color: var(--danger, #e5534b); font-weight: 600; cursor: pointer; }
+.stop-btn:hover:not(:disabled) { background: var(--danger, #e5534b); color: #fff; }
+.stop-btn:disabled { opacity: .6; cursor: default; }
+
+/* guided upload */
+.wz-card { width: min(560px, 100%); }
+.wz-files { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 4px; }
+.wz-files li { display: flex; justify-content: space-between; gap: 12px; font-size: 13px; padding: 8px 10px; border-radius: 10px; background: var(--bg-2); }
+.wz-files li span:first-child { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-weight: 600; }
+.wz-files li span:last-child { color: var(--muted); white-space: nowrap; font-size: 12px; }
+.wz-choices { display: grid; grid-template-columns: repeat(6, 1fr); gap: 8px; }
+.wz-choices button { min-height: 52px; border-radius: 12px; border: 1px solid var(--border-strong); background: var(--bg-2); color: var(--text); font: 600 18px inherit; font-family: inherit; cursor: pointer; display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 2px; }
+.wz-choices button small { font-size: 10.5px; font-weight: 500; color: var(--muted); }
+.wz-choices button:hover { border-color: var(--accent); }
+.wz-choices button[aria-checked="true"] { border-color: var(--accent); background: var(--accent-soft); color: var(--accent); box-shadow: 0 0 0 1px var(--accent) inset; }
+.wz-choices button[aria-checked="true"] small { color: var(--accent); }
+.wz-choices .wz-unknown { grid-column: 1 / -1; flex-direction: row; gap: 8px; font-size: 14px; }
+.wz-hint { margin: 8px 0 0; }
+#wzModel { width: 100%; padding: 9px 10px; border-radius: 10px; border: 1px solid var(--border-strong); background: var(--bg-2); color: var(--text); font: inherit; font-size: 14px; }
+.wz-actions { display: flex; gap: 8px; margin-left: auto; }
+.tr-intro { padding: 12px 14px; border-radius: 12px; background: var(--accent-soft); border: 1px solid color-mix(in srgb, var(--accent) 35%, transparent); font-size: 13.5px; line-height: 1.45; }
+.tr-intro b { display: block; font-size: 14.5px; margin-bottom: 2px; }
+@media (max-width: 520px) { .wz-choices { grid-template-columns: repeat(3, 1fr); } }

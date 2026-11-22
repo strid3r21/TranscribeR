@@ -113,6 +113,8 @@
       for (const m of models) sel.append(new Option(local.has(m) ? `${m} (built-in)` : m, m, false, m === saved));
       $("languageInput").value = store.get("language", c.default_language || "");
       $("autoToggle").checked = store.get("auto", c.auto_transcribe);
+      $("wizToggle").checked = store.get("wizard", true);
+      $("autoToggleWrap").classList.toggle("hidden", $("wizToggle").checked);
       $("speakersField").classList.toggle("hidden", !c.diarization_available);
       const spk = store.get("speakers", c.diarization_default || "auto");
       $("speakersSelect").value = [...$("speakersSelect").options].some((o) => o.value === spk) ? spk : "auto";
@@ -137,6 +139,7 @@
   $("modelSelect").onchange = (e) => store.set("model", e.target.value);
   $("languageInput").onchange = (e) => store.set("language", e.target.value.trim());
   $("autoToggle").onchange = (e) => store.set("auto", e.target.checked);
+  $("wizToggle").onchange = (e) => { store.set("wizard", e.target.checked); $("autoToggleWrap").classList.toggle("hidden", e.target.checked); };
   $("speakersSelect").onchange = (e) => store.set("speakers", e.target.value);
   $("backendStatus").onclick = loadConfig;
 
@@ -165,7 +168,10 @@
     if (prev.status !== f.status && !S.segs.length) renderSegments();
     if (isBusy(prev) && !isBusy(f) && f.has_transcript) {
       await loadTranscript();
-      if (f.status === "done" && !f.error) toast(prev.status === "diarizing" ? speakerToast(f) : "Transcription finished");
+      if (f.status === "done" && !f.error) {
+        if (prev.status !== "diarizing" && teachPending(f)) teachAfter(f);
+        else toast(prev.status === "diarizing" ? speakerToast(f) : "Transcription finished");
+      }
       if (prev.status === "diarizing") loadVoices();
     }
     if (prev.status === "processing" && f.status !== "processing") loadAudio();
@@ -267,13 +273,16 @@
     if (o.model) fd.append("model", o.model);
     if (o.language) fd.append("language", o.language);
     if (o.speakers) fd.append("speakers", o.speakers);
-    fd.append("auto", $("autoToggle").checked ? "true" : "false");
+    const guided = $("wizToggle").checked;
+    fd.append("auto", !guided && $("autoToggle").checked ? "true" : "false");
+    if (guided) wizAdd(tid, file.name);
     const xhr = new XMLHttpRequest();
     xhr.open("POST", "/api/files");
     xhr.upload.onprogress = (e) => {
       if (!e.lengthComputable) return;
       const p = e.loaded / e.total;
       S.uploads.get(tid).progress = p;
+      if (S.wiz?.items.has(tid)) wizRender();
       const li = document.querySelector(`[data-tid="${tid}"]`);
       if (li) {
         li.querySelector(".progress").style.width = p * 100 + "%";
@@ -285,16 +294,18 @@
       if (xhr.status >= 200 && xhr.status < 300) {
         const meta = JSON.parse(xhr.responseText);
         await loadFiles();
-        if (!S.current) openFile(meta.id);
+        if (guided) await wizUploaded(tid, meta.id);
+        if (!S.current || guided) openFile(meta.id);
       } else {
         let msg = xhr.statusText;
         try { msg = JSON.parse(xhr.responseText).detail; } catch { /* ignore */ }
         toast(`Upload failed: ${msg}`, true);
+        wizDrop(tid);
         renderFiles();
       }
       schedulePoll();
     };
-    xhr.onerror = () => { S.uploads.delete(tid); renderFiles(); toast("Upload failed: network error", true); };
+    xhr.onerror = () => { S.uploads.delete(tid); wizDrop(tid); renderFiles(); toast("Upload failed: network error", true); };
     xhr.send(fd);
   }
 
@@ -333,6 +344,7 @@
     renderFiles(); renderHeader(); renderSegments();
     loadAudio();
     if (f.has_transcript) await loadTranscript();
+    if (f.status === "done" && teachPending(f)) teachAfter(f);
   }
 
   function closeFile() {
@@ -403,6 +415,7 @@
     const proc = $("processing");
     const bars = $("procBars");
     bars.innerHTML = "";
+    $("stopBtn").classList.toggle("hidden", !busy || f.status === "processing");
     if (!busy && !f.error) { proc.classList.add("hidden"); return; }
     proc.classList.remove("hidden");
     proc.classList.toggle("error", !busy);
@@ -461,6 +474,23 @@
       renderHeader(); renderSegments(); renderSpeakers();
       await loadFiles(); schedulePoll();
     } catch (e) { toast(e.message, true); }
+  };
+
+  $("stopBtn").onclick = async () => {
+    const f = S.current;
+    if (!f || !isBusy(f)) return;
+    const what = f.status === "diarizing" ? "speaker detection" : f.status === "queued" ? "this queued job" : "this transcription";
+    if (f.status !== "queued" && !confirm(`Stop ${what}? Progress so far is discarded${f.has_transcript ? "; the previous transcript is kept" : ""}.`)) return;
+    $("stopBtn").disabled = true;
+    $("stopBtn").textContent = "Stopping…";
+    try {
+      S.current = await api(`/api/files/${f.id}/cancel`, { method: "POST" });
+      if (S.current.has_transcript) await loadTranscript(); else renderSegments();
+      renderHeader();
+      await loadFiles(); schedulePoll();
+      toast(isBusy(S.current) ? "Stopping…" : "Stopped");
+    } catch (e) { toast(e.message, true); }
+    finally { $("stopBtn").textContent = "Stop"; $("stopBtn").disabled = false; }
   };
 
   function bindMenu(btn) {
@@ -1603,18 +1633,142 @@
     } catch (e) { toast(e.message, true); }
   }
 
+  // ------------------------------------------------------------------ guided upload
+  // Upload -> ask how many speakers + model -> start. When it's done, open Teach with a short intro.
+  const MOSS = "moss-transcribe-diarize";
+  function teachList() { const v = store.get("teachAfter", {}); return v && typeof v === "object" ? v : {}; }
+  function teachPending(f) { return Object.prototype.hasOwnProperty.call(teachList(), f.id); }
+  function teachForget(id) { const l = teachList(); delete l[id]; store.set("teachAfter", l); }
+
+  function wizAdd(tid, name) {
+    if (!S.wiz) {
+      S.wiz = { items: new Map(), started: null };
+      const sel = $("wzModel");
+      sel.innerHTML = "";
+      for (const o of $("modelSelect").options) sel.append(new Option(o.text, o.value));
+      const local = S.config?.local_models || [];
+      const want = store.get("wizModel", null);
+      sel.value = [...sel.options].some((o) => o.value === want) ? want : local.includes(MOSS) ? MOSS : $("modelSelect").value;
+      wizModelHint();
+      wizPick(store.get("wizSpeakers", "auto"));
+      $("wzTeach").checked = store.get("wizTeach", true);
+      $("wzAlways").checked = true;
+      $("wizard").classList.remove("hidden");
+      setTimeout(() => $("wzStart").focus(), 50);
+    }
+    S.wiz.items.set(tid, { name, fid: null });
+    wizRender();
+  }
+  function wizRender() {
+    if (!S.wiz) return;
+    const ul = $("wzFiles");
+    ul.innerHTML = "";
+    for (const [tid, it] of S.wiz.items) {
+      const up = S.uploads.get(tid);
+      const state = it.fid ? "uploaded" : up ? (up.progress < 1 ? `uploading ${Math.round(up.progress * 100)}%` : "finishing upload") : "";
+      const li = el("li");
+      li.append(el("span", null, it.name), el("span", null, state));
+      ul.append(li);
+    }
+    $("wzTitle").textContent = S.wiz.items.size > 1 ? `Transcribe ${S.wiz.items.size} recordings` : "Transcribe your recording";
+  }
+  function wizPick(v) {
+    const box = $("wzSpeakers");
+    if (![...box.children].some((b) => b.dataset.v === v)) v = "auto";
+    for (const b of box.children) b.setAttribute("aria-checked", b.dataset.v === v ? "true" : "false");
+    $("wzTeach").closest("label").classList.toggle("hidden", v === "off");
+  }
+  function wizSpeakers() { return [...$("wzSpeakers").children].find((b) => b.getAttribute("aria-checked") === "true")?.dataset.v || "auto"; }
+  function wizModelHint() {
+    const m = $("wzModel").value;
+    $("wzModelHint").textContent = m === MOSS && (S.config?.local_models || []).includes(MOSS)
+      ? "Built in: transcribes and tells speakers apart in one pass. Downloads about 1 GB the first time."
+      : /moss/i.test(m) ? "MOSS through llama-swap: transcribes and tells speakers apart in one pass."
+      : "Speakers are detected separately on the server CPU.";
+  }
+  $("wzSpeakers").onclick = (e) => { const b = e.target.closest("button"); if (b) wizPick(b.dataset.v); };
+  $("wzModel").onchange = wizModelHint;
+  async function wizUploaded(tid, fid) {
+    const W = S.wiz;
+    if (W?.items.has(tid)) {
+      W.items.get(tid).fid = fid;
+      wizRender();
+      return;
+    }
+    const pending = S.wizStarted?.get(tid);  // Start was pressed before this upload finished
+    if (pending) { S.wizStarted.delete(tid); await wizTranscribe(fid, pending); }
+  }
+  function wizDrop(tid) {
+    S.wizStarted?.delete(tid);
+    if (!S.wiz) return;
+    S.wiz.items.delete(tid);
+    if (!S.wiz.items.size) wizClose(); else wizRender();
+  }
+  async function wizTranscribe(fid, o) {
+    if (o.teach) { const l = teachList(); l[fid] = o.expected; store.set("teachAfter", l); }
+    try {
+      const meta = await api(`/api/files/${fid}/transcribe`, { method: "POST", body: JSON.stringify(o.body) });
+      if (S.current?.id === fid) { S.current = meta; renderHeader(); }
+    } catch (e) { toast(e.message, true); teachForget(fid); }
+  }
+  async function wizStart() {
+    const W = S.wiz;
+    if (!W) return;
+    const speakers = wizSpeakers();
+    const model = $("wzModel").value;
+    store.set("wizSpeakers", speakers); store.set("wizModel", model); store.set("wizTeach", $("wzTeach").checked);
+    const body = { model };
+    const lang = $("languageInput").value.trim();
+    if (lang) body.language = lang;
+    if (S.config?.diarization_available || /moss/i.test(model)) body.speakers = speakers;
+    const o = { body, teach: $("wzTeach").checked && speakers !== "off", expected: parseInt(speakers, 10) || null };
+    S.wizStarted = S.wizStarted || new Map();
+    let waiting = 0;
+    for (const [tid, it] of W.items) {
+      if (it.fid) await wizTranscribe(it.fid, o);
+      else { S.wizStarted.set(tid, o); waiting++; }
+    }
+    wizClose();
+    await loadFiles(); schedulePoll();
+    toast(waiting ? "Transcription will start as soon as the upload finishes" : "Transcription started");
+  }
+  function wizLater() { wizClose(); }
+  function wizClose() {
+    if (!$("wzAlways").checked) { store.set("wizard", false); $("wizToggle").checked = false; $("autoToggleWrap").classList.remove("hidden"); toast("Guided upload is off. Turn it back on with the Guided switch at the top."); }
+    S.wiz = null;
+    $("wizard").classList.add("hidden");
+  }
+  $("wzStart").onclick = wizStart;
+  $("wzLater").onclick = wizLater;
+  $("wzClose").onclick = wizLater;
+  let wzDownOnBackdrop = false;
+  $("wizard").addEventListener("mousedown", (e) => { wzDownOnBackdrop = e.target.id === "wizard"; });
+  $("wizard").addEventListener("click", (e) => { if (e.target.id === "wizard" && wzDownOnBackdrop) wizLater(); });
+
+  function teachAfter(f) {
+    if (S.current?.id !== f.id || S.tr || !S.segs.length) return;
+    const expected = teachList()[f.id] || null;
+    teachForget(f.id);
+    const found = Object.keys(S.speakers).length;
+    if (found < 2 && !(expected >= 2)) { toast("Transcription finished"); return; }
+    const n = Math.max(found, expected || 0);
+    openTrainer(`<b>Transcription finished 🎉</b>We found ${found === 1 ? "one voice" : found + " speakers"}${expected && expected !== found ? ` (you expected ${expected})` : ""}. Tag a few clips for each person below, two or three each is plenty, and we'll match every line to the right speaker. Name them too, and they'll be recognized automatically next time.`, n >= 2 ? n : null);
+  }
+
   // ------------------------------------------------------------------ teach speakers
   const PLAY_ICON = '<svg viewBox="0 0 24 24"><path d="M8 5v14l11-7z"/></svg>';
   const STOP_ICON = '<svg viewBox="0 0 24 24"><path d="M7 7h10v10H7z"/></svg>';
 
-  function openTrainer() {
+  function openTrainer(intro = null, expected = null) {
     if (!S.segs.length || !S.current?.has_audio) return;
+    $("trIntro").classList.toggle("hidden", !intro);
+    $("trIntro").innerHTML = intro || "";
     const existing = Object.entries(S.speakers);
     let people;
-    if (existing.length >= 2 && existing.length <= 6) {
+    if (existing.length >= 2 && existing.length <= 6 && !(expected && existing.length < expected)) {
       people = existing.map(([id, v]) => ({ id, name: v.name || id }));
     } else {
-      const sel = parseInt($("speakersSelect").value, 10);
+      const sel = expected || parseInt($("speakersSelect").value, 10);
       const n = Number.isFinite(sel) && sel >= 2 ? sel : 2;
       const saved = [...S.voices].sort((a, b) => b.n - a.n);
       people = Array.from({ length: n }, (_, k) => ({ id: "S" + (k + 1), name: saved[k]?.name || `Speaker ${k + 1}` }));
@@ -1872,6 +2026,11 @@
 
   // ------------------------------------------------------------------ keyboard
   document.addEventListener("keydown", (e) => {
+    if (S.wiz) { // guided upload dialog open
+      if (e.key === "Escape") { e.preventDefault(); wizLater(); }
+      else if (e.key === "Enter" && !e.target.closest("select")) { e.preventDefault(); wizStart(); }
+      return;
+    }
     if (S.tr) { // Teach dialog open: it owns the keyboard (no shortcuts reach the player behind it)
       if (e.key === "Escape") { e.preventDefault(); closeTrainer(); return; }
       if (e.code === "Space" && !e.target.closest("input")) {

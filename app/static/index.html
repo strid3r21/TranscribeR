@@ -41,7 +41,10 @@
           <option value="5">5</option><option value="6">6</option><option value="8">8</option>
         </select>
       </label>
-      <label class="toggle" title="Start transcribing as soon as a file is uploaded">
+      <label class="toggle" title="After uploading, ask how many speakers to expect and which model to use">
+        <input type="checkbox" id="wizToggle"><span class="switch"></span><span>Guided</span>
+      </label>
+      <label class="toggle" id="autoToggleWrap" title="Start transcribing as soon as a file is uploaded">
         <input type="checkbox" id="autoToggle"><span class="switch"></span><span>Auto-transcribe</span>
       </label>
       <div class="backend" id="backendStatus" title="llama-swap connection"><span class="dot"></span><span class="label">Connecting…</span></div>
@@ -162,6 +165,7 @@
             <div class="muted" id="procDetail"></div>
             <div class="bars" id="procBars"></div>
           </div>
+          <button class="stop-btn hidden" id="stopBtn" title="Stop this job. Any previous transcript is kept.">Stop</button>
         </div>
 
         <div class="body">
@@ -246,6 +250,7 @@
         <button class="btn icon sm" id="trClose" title="Close">✕</button>
       </div>
       <div class="modal-body">
+        <div class="tr-intro hidden" id="trIntro"></div>
         <section>
           <div class="tr-label"><b>1</b> Who is speaking in this file?</div>
           <div class="tr-people" id="trPeople"></div>
@@ -264,6 +269,43 @@
       <div class="modal-foot">
         <label class="toggle"><input type="checkbox" id="trRemember" checked><span class="switch"></span><span>Remember these voices for future files</span></label>
         <button class="btn primary" id="trApply" disabled>Apply to whole file</button>
+      </div>
+    </div>
+  </div>
+  <div class="modal hidden" id="wizard" role="dialog" aria-modal="true" aria-labelledby="wzTitle">
+    <div class="modal-card wz-card">
+      <div class="modal-head">
+        <h3 id="wzTitle">Transcribe your recording</h3>
+        <button class="btn icon sm" id="wzClose" title="Not now">✕</button>
+      </div>
+      <div class="modal-body">
+        <ul class="wz-files" id="wzFiles"></ul>
+        <section>
+          <div class="tr-label"><b>1</b> How many speakers do you expect?</div>
+          <div class="wz-choices" id="wzSpeakers" role="radiogroup">
+            <button data-v="off" role="radio">1<small>just one</small></button>
+            <button data-v="2" role="radio">2</button>
+            <button data-v="3" role="radio">3</button>
+            <button data-v="4" role="radio">4</button>
+            <button data-v="5" role="radio">5</button>
+            <button data-v="6" role="radio">6</button>
+            <button data-v="auto" role="radio" class="wz-unknown">I don't know<small>detect automatically</small></button>
+          </div>
+          <p class="muted tr-hint wz-hint">A known number gives the most reliable speaker labels.</p>
+        </section>
+        <section>
+          <div class="tr-label"><b>2</b> Model</div>
+          <select id="wzModel"></select>
+          <p class="muted tr-hint wz-hint" id="wzModelHint"></p>
+        </section>
+        <label class="toggle"><input type="checkbox" id="wzTeach" checked><span class="switch"></span><span>When it's done, help me tag who's who</span></label>
+      </div>
+      <div class="modal-foot">
+        <label class="toggle"><input type="checkbox" id="wzAlways" checked><span class="switch"></span><span>Ask every time I upload</span></label>
+        <div class="wz-actions">
+          <button class="btn" id="wzLater">Not now</button>
+          <button class="btn primary" id="wzStart">Start transcription</button>
+        </div>
       </div>
     </div>
   </div>

@@ -294,6 +294,8 @@ async def job_transcribe(fid: str, opts: dict) -> None:
             msg = f"Audio chunk too large for the model's context even after splitting: {msg[:300]}"
         update_meta(fid, status="error", error=msg)
     finally:
+        if diar_task and not diar_task.done():  # stopped by the user
+            diar_task.cancel()
         PROGRESS.pop(fid, None)
         shutil.rmtree(d / "work", ignore_errors=True)
 
@@ -380,23 +382,51 @@ async def job_identify(fid: str, opts: dict) -> None:
         PROGRESS.pop(fid, None)
 
 
+RUNNING: dict[str, asyncio.Task] = {}
+
+
 async def enqueue(fid: str, opts: dict) -> None:
+    opts = {**opts, "_tok": uuid.uuid4().hex[:8]}  # lets a stopped job's stale queue entry be skipped
     update_meta(fid, status="queued", error=None, queued_opts=opts)
     await queue.put((fid, opts))
+
+
+def settle_status(fid: str, **extra: Any) -> None:
+    """Back to the resting state: 'done' if there is a transcript, else 'ready'."""
+    done = (fdir(fid) / "transcript.json").exists()
+    update_meta(fid, status="done" if done else "ready", queued_opts=None, **extra)
+
+
+async def run_job(fid: str, opts: dict) -> None:
+    if opts.get("job") == "diarize":
+        await job_diarize(fid, opts)
+    elif opts.get("job") == "identify":
+        await job_identify(fid, opts)
+    else:
+        await job_transcribe(fid, opts)
 
 
 async def worker() -> None:
     while True:
         fid, opts = await queue.get()
         try:
+            meta = read_json(cfg.FILES_DIR / fid / "meta.json") or {}
+            if meta.get("status") != "queued" or (meta.get("queued_opts") or {}).get("_tok") != opts.get("_tok"):
+                continue  # stopped (or re-queued) while waiting
             if (cfg.FILES_DIR / fid / "audio.mp3").exists():
-                if opts.get("job") == "diarize":
-                    await job_diarize(fid, opts)
-                elif opts.get("job") == "identify":
-                    await job_identify(fid, opts)
-                else:
-                    await job_transcribe(fid, opts)
-            elif (cfg.FILES_DIR / fid / "meta.json").exists():
+                task = asyncio.create_task(run_job(fid, opts))
+                RUNNING[fid] = task
+                try:
+                    await task
+                except asyncio.CancelledError:
+                    if not task.cancelled():
+                        raise
+                    log.info("job for %s stopped by the user", fid)
+                    PROGRESS.pop(fid, None)
+                    settle_status(fid, error=None, stopped_at=time.time())
+                finally:
+                    RUNNING.pop(fid, None)
+            else:
                 update_meta(fid, status="error", error="Audio file is missing")
         except Exception:  # noqa: BLE001
             log.exception("worker error")
@@ -572,6 +602,8 @@ class TranscribeBody(BaseModel):
 @app.post("/api/files/{fid}/transcribe")
 async def start_transcription(fid: str, body: TranscribeBody) -> dict:
     meta = load_meta(fid)
+    if meta["status"] == "processing":  # still converting: start as soon as it's ready
+        return public_meta(update_meta(fid, auto_transcribe=True, upload_opts=body.model_dump(exclude_none=True)))
     if meta["status"] in ACTIVE_STATES:
         raise HTTPException(409, f"File is already {meta['status']}")
     if not (fdir(fid) / "audio.mp3").exists():
@@ -1032,6 +1064,24 @@ async def download(fid: str, format: str = Query("txt")) -> Response:
     stem = re.sub(r"[^\w\-. ]", "_", Path(meta["name"]).stem) or "transcript"
     return Response(body, media_type=f"{mime}; charset=utf-8",
                     headers={"Content-Disposition": f'attachment; filename="{stem}.{ext}"'})
+
+
+@app.post("/api/files/{fid}/cancel")
+async def cancel_job(fid: str) -> dict:
+    """Stop a queued or running job. The previous transcript (if any) is kept."""
+    load_meta(fid)
+    task = RUNNING.get(fid)
+    if task and not task.done():
+        moss.cancel_all()  # abort the native model run right away
+        task.cancel()
+        for _ in range(300):  # the worker resets the status once the job has unwound
+            if fid not in RUNNING:
+                break
+            await asyncio.sleep(0.1)
+    else:
+        PROGRESS.pop(fid, None)
+        settle_status(fid, error=None, stopped_at=time.time())
+    return public_meta(load_meta(fid))
 
 
 @app.get("/api/health")
