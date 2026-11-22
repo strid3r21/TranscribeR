@@ -42,7 +42,7 @@
   <Config Name="Nvidia GPU" Target="NVIDIA_VISIBLE_DEVICES" Default="" Mode="" Description="For the built-in MOSS engine on GPU: 'all' or a GPU UUID, plus --runtime=nvidia in Extra Parameters. Empty = CPU." Type="Variable" Display="always" Required="false" Mask="false"/>
   <Config Name="Built-in MOSS engine" Target="LOCAL_MOSS" Default="true" Mode="" Description="Offer moss-transcribe-diarize (built-in) in the model list. Model (~1 GB) downloads to /data/models on first use." Type="Variable" Display="advanced" Required="false" Mask="false">true</Config>
   <Config Name="MOSS quantization" Target="MOSS_QUANT" Default="Q8_0" Mode="" Description="Q8_0 (best, 987 MB), Q6_K, Q5_K_M or Q4_K_M (617 MB)" Type="Variable" Display="advanced" Required="false" Mask="false">Q8_0</Config>
-  <Config Name="MOSS backend" Target="MOSS_BACKEND" Default="auto" Mode="" Description="auto (GPU via Vulkan if available), vulkan or cpu" Type="Variable" Display="advanced" Required="false" Mask="false">auto</Config>
+  <Config Name="MOSS backend" Target="MOSS_BACKEND" Default="auto" Mode="" Description="auto (CUDA on NVIDIA GPUs, else Vulkan, else CPU), vulkan or cpu" Type="Variable" Display="advanced" Required="false" Mask="false">auto</Config>
   <Config Name="MOSS chunk seconds" Target="MOSS_CHUNK_SECONDS" Default="600" Mode="" Description="Long audio is split at pauses into chunks this long (memory ~85 MB per minute). Chunks that run out of memory are split automatically." Type="Variable" Display="advanced" Required="false" Mask="false">600</Config>
   <Config Name="Max upload MB" Target="MAX_UPLOAD_MB" Default="4096" Mode="" Description="Upload size limit" Type="Variable" Display="advanced" Required="false" Mask="false">4096</Config>
 </Container>

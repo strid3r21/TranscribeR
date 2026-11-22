@@ -474,7 +474,8 @@ async def config() -> dict:
     except Exception as exc:  # noqa: BLE001
         error = f"Could not reach llama-swap at {cfg.LLAMA_SWAP_URL}: {exc}"
     local = [moss.MODEL_ID] if moss.available() else []
-    return {"models": local + [m for m in models if m not in local], "local_models": local,
+    engine = moss.engine_info() if local else None
+    return {"models": local + [m for m in models if m not in local], "local_models": local, "engine": engine,
             "remote_count": len(models), "default_model": cfg.DEFAULT_MODEL, "default_language": cfg.DEFAULT_LANGUAGE,
             "uncertainty_threshold": cfg.UNCERTAINTY_THRESHOLD, "word_threshold": cfg.WORD_THRESHOLD,
             "auto_transcribe": cfg.AUTO_TRANSCRIBE, "backend": cfg.LLAMA_SWAP_URL, "backend_error": error,

@@ -1,3 +1,10 @@
+# CUDA build of transcribe.cpp (built-in MOSS engine on NVIDIA GPUs), assembled in a throwaway stage.
+FROM python:3.12-slim AS cuda
+RUN pip download --no-deps --only-binary=:all: --platform manylinux_2_27_x86_64 --platform manylinux2014_x86_64 \
+      -d /wheels nvidia-cublas-cu12==12.9.1.4 nvidia-cuda-runtime-cu12==12.9.79
+COPY docker/fetch_cuda.py /tmp/fetch_cuda.py
+RUN python /tmp/fetch_cuda.py /opt/transcribe-cuda /wheels
+
 FROM python:3.12-slim
 
 RUN apt-get update \
@@ -11,6 +18,8 @@ RUN pip install --no-cache-dir -r requirements.txt
 # Speaker diarization models (CPU, ~45 MB): pyannote segmentation 3.0 + NeMo TitaNet-small embeddings.
 COPY docker/fetch_models.py /tmp/fetch_models.py
 RUN python /tmp/fetch_models.py /opt/models && rm /tmp/fetch_models.py
+
+COPY --from=cuda /opt/transcribe-cuda /opt/transcribe-cuda
 
 COPY app/ /app/
 

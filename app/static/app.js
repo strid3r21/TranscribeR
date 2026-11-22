@@ -398,7 +398,7 @@
     const dev = isBusy(f) ? f.progress?.device : (f.status === "done" ? f.device : null);
     if (dev) {
       const tag = el("span", "dev-tag dev-" + dev.kind.toLowerCase().replace(/[^a-z]/g, ""), dev.kind);
-      tag.title = dev.name || dev.kind;
+      tag.title = (dev.name || dev.kind) + (dev.why ? `\nWhy not GPU: ${dev.why}` : "");
       meta.append(tag);
     }
     if (f.transcribe_seconds) add(`took ${fmt(f.transcribe_seconds)}${f.chunks > 1 ? ` · ${f.chunks} chunks` : ""}`);
@@ -434,6 +434,7 @@
       const dv = p.device;
       $("procTitle").textContent = `Transcribing with ${f.model || "model"}${dv ? (dv.kind === "llama-swap" ? " via llama-swap" : ` on ${dv.kind}`) : ""}…`;
       $("procTitle").title = dv?.name || "";
+      if (dv?.kind === "CPU" && dv.why) $("procTitle").textContent += ` (no GPU: ${dv.why})`;
       let detail = `${fmt(f.elapsed || 0)} elapsed`;
       if (p.label) detail += ` · ${p.label}`;
       else if (p.stage === "speakers") detail += " · matching speakers to text";

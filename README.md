@@ -52,12 +52,13 @@ Diarization uses [sherpa-onnx](https://github.com/k2-fsa/sherpa-onnx) with the p
 
 [MOSS-Transcribe-Diarize](https://huggingface.co/handy-computer/moss-transcribe-diarize-gguf) (0.9B, English and Chinese) writes the transcript *and* who said it, with real start/end times for every turn. It runs on [transcribe.cpp](https://github.com/handy-computer/transcribe.cpp), not llama-server, so there are two ways to use it:
 
-**Built in (simplest).** Pick **moss-transcribe-diarize (built-in)** in the model dropdown. The model (Q8_0, about 1 GB) downloads to `/data/models` the first time. It uses the GPU through Vulkan when the container can see one, and the CPU otherwise:
+**Built in (simplest).** Pick **moss-transcribe-diarize (built-in)** in the model dropdown. The model (Q8_0, about 1 GB) downloads to `/data/models` the first time.
 
-- About 45× real time on an RTX 4070 (warm), so a 42-minute file takes about 2½ minutes.
-- About 3× real time on a 12-core CPU.
+- **NVIDIA GPUs** run on CUDA: about 30× real time on an RTX 4070, so a 42-minute file takes about 3½ minutes.
+- **Other GPUs** run on Vulkan.
+- **Otherwise** it uses the CPU: about 3× real time on a 12-core CPU.
 
-The model is loaded only while a job runs, so it doesn't hold GPU memory between jobs. On Unraid with the Nvidia Driver plugin, give the container a GPU: add `--runtime=nvidia` to *Extra Parameters* and set `NVIDIA_VISIBLE_DEVICES` to `all` or a GPU UUID.
+The model is loaded only while a job runs, so it doesn't hold GPU memory between jobs. On Unraid with the Nvidia Driver plugin, add `--runtime=nvidia` to *Extra Parameters* (Advanced View) and set `NVIDIA_VISIBLE_DEVICES` to `all` or a GPU UUID. Each file shows a **GPU**/**CPU** badge; when it fell back to CPU, hover it to see why.
 
 **Through llama-swap.** `app/moss_server.py` is a tiny OpenAI-compatible server (`/v1/audio/transcriptions`, `/v1/models`, `/health`) that llama-swap can start and stop like any other model. Requirements:
 
@@ -154,7 +155,7 @@ See `docker-compose.yml` for the same setup as a compose file.
 | `LOCAL_MOSS` | `true` | Offer the built-in MOSS-Transcribe-Diarize engine |
 | `MOSS_QUANT` | `Q8_0` | Which GGUF to download: `Q8_0`, `Q6_K`, `Q5_K_M`, `Q4_K_M`, `F16` |
 | `MOSS_MODEL_PATH` / `MOSS_MODEL_URL` | – | Use your own GGUF file / download URL |
-| `MOSS_BACKEND` | `auto` | `auto` (Vulkan GPU if present), `vulkan` or `cpu` |
+| `MOSS_BACKEND` | `auto` | `auto` (CUDA for NVIDIA, else Vulkan, else CPU), `vulkan` or `cpu` |
 | `MOSS_THREADS` | `0` | CPU threads for MOSS (0 = all) |
 | `MOSS_CHUNK_SECONDS` | `600` | Chunk length for the built-in engine |
 | `MOSS_REMOTE_MATCH` | `moss` | llama-swap model names (regex) that speak MOSS's format |

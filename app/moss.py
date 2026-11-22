@@ -31,6 +31,61 @@ import settings as cfg
 log = logging.getLogger("transcriber.moss")
 
 MODEL_ID = "moss-transcribe-diarize"
+CUDA_DIR = Path(os.getenv("MOSS_CUDA_DIR", "/opt/transcribe-cuda"))
+ENGINE: dict = {"library": "default", "notes": []}  # which native build was picked, and why
+
+
+def _select_native() -> None:
+    """Pick the transcribe.cpp build before it is first imported.
+
+    NVIDIA GPU visible (driver library mounted by the Nvidia container runtime, >= 1 device)
+    -> CUDA build. Otherwise the default build (CPU, or Vulkan for other GPUs).
+    """
+    import ctypes
+
+    notes = ENGINE["notes"]
+    if os.environ.get("TRANSCRIBE_LIBRARY"):
+        ENGINE["library"] = "custom"
+        return
+    if cfg.MOSS_BACKEND in ("cpu", "vulkan"):
+        notes.append(f"MOSS_BACKEND={cfg.MOSS_BACKEND}")
+        return
+    lib = CUDA_DIR / "libtranscribe.so"
+    if not lib.exists():
+        notes.append("this image has no CUDA build")
+        return
+    try:
+        cuda = ctypes.CDLL("libcuda.so.1")
+    except OSError:
+        notes.append("no NVIDIA driver inside the container (add --runtime=nvidia to Extra Parameters "
+                     "and set NVIDIA_VISIBLE_DEVICES)")
+        return
+    count = ctypes.c_int(0)
+    rc = cuda.cuInit(0)
+    if rc != 0 or cuda.cuDeviceGetCount(ctypes.byref(count)) != 0 or count.value < 1:
+        notes.append(f"NVIDIA driver found but no usable GPU (cuInit={rc}; check NVIDIA_VISIBLE_DEVICES)")
+        return
+    os.environ["TRANSCRIBE_LIBRARY"] = str(lib)
+    ENGINE["library"] = "cuda"
+    log.info("MOSS will use the CUDA build (%d GPU%s visible)", count.value, "s" if count.value > 1 else "")
+
+
+if cfg.LOCAL_MOSS:
+    try:
+        _select_native()
+    except Exception as exc:  # noqa: BLE001
+        ENGINE["notes"].append(f"GPU check failed: {exc}")
+
+
+def engine_info() -> dict:
+    out = {"library": ENGINE["library"], "notes": list(ENGINE["notes"]), "devices": []}
+    try:
+        import transcribe_cpp as tc
+
+        out["devices"] = [{"name": d.name, "description": d.description, "kind": d.kind} for d in tc.backends()]
+    except Exception as exc:  # noqa: BLE001
+        out["notes"].append(f"engine unavailable: {exc}")
+    return out
 
 
 def available() -> bool:
@@ -139,7 +194,15 @@ class _Local:
         import transcribe_cpp as tc
 
         self.tc = tc
-        self.model = tc.Model(str(self.path), backend=cfg.MOSS_BACKEND)
+        self.why = "; ".join(ENGINE["notes"])
+        try:
+            self.model = tc.Model(str(self.path), backend=cfg.MOSS_BACKEND)
+        except (tc.BackendError, tc.ModelLoadError, tc.OutOfMemory) as exc:
+            if cfg.MOSS_BACKEND == "cpu":
+                raise
+            log.warning("MOSS could not load on the GPU (%s); using the CPU", exc)
+            self.why = f"GPU load failed: {exc}"
+            self.model = tc.Model(str(self.path), backend="cpu")
         self.backend = self.model.backend
         try:
             dev = self.model.device
@@ -148,6 +211,8 @@ class _Local:
         except Exception:  # noqa: BLE001
             gpu, name = self.backend.lower() != "cpu", self.backend
         self.device = {"kind": "GPU" if gpu else "CPU", "name": name}
+        if not gpu and self.why:
+            self.device["why"] = self.why
         log.info("MOSS loaded on %s (%s)", self.backend, name)
 
     def _run(self, audio: Path, a: float, b: float, opts: dict):
