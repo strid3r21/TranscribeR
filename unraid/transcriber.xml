@@ -12,8 +12,8 @@
   <Overview>Web UI for transcribing audio through a llama-swap hosted speech-to-text model (whisper.cpp, Nemotron/llama-server audio models, faster-whisper, etc). Long files are chunked automatically, speakers are detected on the CPU and can be named. Upload audio (auto converted to MP3), follow a synced timestamped transcript while it plays, edit it inline, review segments flagged as uncertain, and export plain text, timestamped text, SRT, VTT or JSON.</Overview>
   <Category>MediaApp:Other Productivity: Tools:</Category>
   <WebUI>http://[IP]:[PORT:8000]/</WebUI>
-  <TemplateURL/>
-  <Icon>https://raw.githubusercontent.com/strid3r21/TranscribeR/main/app/static/favicon.svg</Icon>
+  <TemplateURL>https://raw.githubusercontent.com/strid3r21/TranscribeR/main/unraid/transcriber.xml</TemplateURL>
+  <Icon>https://raw.githubusercontent.com/strid3r21/TranscribeR/main/unraid/icon.png</Icon>
   <ExtraParams/>
   <PostArgs/>
   <CPUset/>
