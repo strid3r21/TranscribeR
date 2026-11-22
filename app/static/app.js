@@ -1035,7 +1035,7 @@
       renderSegments(); queueSave();
     }, 250);
   }
-  function splitAt(i, offset) {
+  function splitAt(i, offset, askSpeaker = false) {
     const s = S.segs[i];
     const text = s.text;
     if (offset <= 0 || offset >= text.length) { toast("Place the cursor inside the text to split"); return; }
@@ -1055,6 +1055,12 @@
     S.segs.splice(i, 1, first, second);
     renderSegments(); queueSave();
     placeCaret(rowEl(i + 1).querySelector(".seg-text"), 0);
+    if (askSpeaker && Object.keys(S.speakers).length) {  // who says the second part?
+      const row = rowEl(i + 1);
+      row.classList.add("flash"); setTimeout(() => row.classList.remove("flash"), 1200);
+      const chip = row.querySelector(".spk-chip");
+      if (chip) showSpkMenu(i + 1, chip, false);
+    }
   }
   function mergeWithPrevious(i) {
     const prev = S.segs[i - 1], cur = S.segs[i];
@@ -1653,8 +1659,52 @@
     b.style.left = Math.max(bw / 2 + 8, Math.min(rect.left + rect.width / 2, innerWidth - bw / 2 - 8)) + "px";
     b.style.top = (below ? rect.bottom + 10 : rect.top - bh - 10) + "px";
   }
-  segBox.addEventListener("mouseup", () => setTimeout(showBubble, 0));
-  segBox.addEventListener("keyup", (e) => { if (e.shiftKey || e.key === "Shift") showBubble(); else hideBubble(); });
+  segBox.addEventListener("mouseup", () => setTimeout(() => { showBubble(); showSplit(); }, 0));
+  segBox.addEventListener("keyup", (e) => {
+    if (e.shiftKey || e.key === "Shift") showBubble(); else hideBubble();
+    if (/^Arrow|^Home$|^End$/.test(e.key) && !e.shiftKey) showSplit(); else hideSplit();
+  });
+  // "Split here" appears where you click inside a line (snapped to the nearest word boundary).
+  function hideSplit() { $("splitBubble").classList.add("hidden"); S.splitAt = null; }
+  function showSplit() {
+    hideSplit();
+    const sel = getSelection();
+    if (!sel.rangeCount || !sel.isCollapsed || !S.current || isBusy(S.current)) return;
+    const txt = sel.anchorNode && (sel.anchorNode.nodeType === 1 ? sel.anchorNode : sel.anchorNode.parentElement)?.closest(".seg-text");
+    if (!txt) return;
+    const i = +txt.parentElement.dataset.i;
+    const s = S.segs[i];
+    let off = caretOffset(txt);
+    if (!s || off < 0) return;
+    const t = s.text;
+    if (/\S/.test(t[off - 1] || "") && /\S/.test(t[off] || "")) {  // inside a word: move to its nearest edge
+      let a = off, b = off;
+      while (a > 0 && /\S/.test(t[a - 1])) a--;
+      while (b < t.length && /\S/.test(t[b])) b++;
+      off = off - a <= b - off ? a : b;
+    }
+    if (!t.slice(0, off).trim() || !t.slice(off).trim()) return;  // at the very start or end: nothing to split
+    S.splitAt = { i, off, id: s.id };
+    const r = sel.getRangeAt(0);
+    const rect = r.getClientRects()[0] || r.getBoundingClientRect();
+    if (!rect || (!rect.left && !rect.top)) return;
+    const bub = $("splitBubble");
+    bub.classList.remove("hidden");
+    const bh = bub.offsetHeight, bw = bub.offsetWidth;
+    const below = rect.top - bh - 12 < 8;
+    bub.classList.toggle("below", below);
+    bub.style.left = Math.max(bw / 2 + 8, Math.min(rect.left, innerWidth - bw / 2 - 8)) + "px";
+    bub.style.top = (below ? rect.bottom + 10 : rect.top - bh - 10) + "px";
+  }
+  $("splitBubble").addEventListener("mousedown", (e) => e.preventDefault());
+  $("splitBtn").onclick = (e) => {
+    e.stopPropagation();
+    const t = S.splitAt; hideSplit();
+    if (!t || S.segs[t.i]?.id !== t.id) return;
+    splitAt(t.i, t.off, true);
+  };
+  segBox.addEventListener("keydown", (e) => { if (!/^Arrow|^Home$|^End$|^Shift$|^Alt$/.test(e.key)) hideSplit(); });
+  segBox.addEventListener("scroll", hideSplit);
   document.addEventListener("selectionchange", () => { const s = getSelection(); if (!s.rangeCount || s.isCollapsed) hideBubble(); });
   $("selBubble").addEventListener("mousedown", (e) => e.preventDefault()); // keep the selection
   $("bubRedact").onclick = () => { hideBubble(); doRedact(S.ctx, false, false); };
