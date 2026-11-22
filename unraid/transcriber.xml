@@ -1,0 +1,36 @@
+<?xml version="1.0"?>
+<Container version="2">
+  <Name>TranscribeR</Name>
+  <Repository>ghcr.io/strid3r21/transcriber:latest</Repository>
+  <Registry>https://github.com/strid3r21/TranscribeR/pkgs/container/transcriber</Registry>
+  <Network>bridge</Network>
+  <MyIP/>
+  <Shell>sh</Shell>
+  <Privileged>false</Privileged>
+  <Support>https://github.com/strid3r21/TranscribeR</Support>
+  <Project>https://github.com/strid3r21/TranscribeR</Project>
+  <Overview>Web UI for transcribing audio through a llama-swap hosted speech-to-text model (whisper.cpp, faster-whisper, etc). Upload audio (auto converted to MP3), follow a synced timestamped transcript while it plays, edit it inline, review segments flagged as uncertain, and export plain text, timestamped text, SRT, VTT or JSON.</Overview>
+  <Category>MediaApp:Other Productivity: Tools:</Category>
+  <WebUI>http://[IP]:[PORT:8000]/</WebUI>
+  <TemplateURL/>
+  <Icon>https://raw.githubusercontent.com/strid3r21/TranscribeR/main/app/static/favicon.svg</Icon>
+  <ExtraParams/>
+  <PostArgs/>
+  <CPUset/>
+  <DateInstalled/>
+  <DonateText/>
+  <DonateLink/>
+  <Requires>A running llama-swap instance with a transcription model configured (endpoint /v1/audio/transcriptions).</Requires>
+  <Config Name="WebUI Port" Target="8000" Default="8000" Mode="tcp" Description="Port for the web interface" Type="Port" Display="always" Required="true" Mask="false">8000</Config>
+  <Config Name="Data" Target="/data" Default="/mnt/user/appdata/transcriber" Mode="rw" Description="Uploaded audio, waveforms and transcripts" Type="Path" Display="always" Required="true" Mask="false">/mnt/user/appdata/transcriber</Config>
+  <Config Name="llama-swap URL" Target="LLAMA_SWAP_URL" Default="http://192.168.1.10:8080" Mode="" Description="Base URL of your llama-swap server (no trailing /v1)" Type="Variable" Display="always" Required="true" Mask="false">http://192.168.1.10:8080</Config>
+  <Config Name="Default model" Target="DEFAULT_MODEL" Default="whisper" Mode="" Description="Model name from your llama-swap config. Users can pick any model in the UI." Type="Variable" Display="always" Required="true" Mask="false">whisper</Config>
+  <Config Name="llama-swap API key" Target="LLAMA_SWAP_API_KEY" Default="" Mode="" Description="Only if llama-swap is configured with apiKeys" Type="Variable" Display="always" Required="false" Mask="true"/>
+  <Config Name="Default language" Target="DEFAULT_LANGUAGE" Default="" Mode="" Description="ISO code like en. Empty = auto detect" Type="Variable" Display="advanced" Required="false" Mask="false"/>
+  <Config Name="Auto transcribe" Target="AUTO_TRANSCRIBE" Default="true" Mode="" Description="Default for the auto-transcribe toggle" Type="Variable" Display="advanced" Required="false" Mask="false">true</Config>
+  <Config Name="Upstream format" Target="UPSTREAM_FORMAT" Default="mp3" Mode="" Description="Format sent to the model: mp3, or wav (16kHz mono) if your backend cannot decode mp3" Type="Variable" Display="advanced" Required="false" Mask="false">mp3</Config>
+  <Config Name="Request timeout" Target="REQUEST_TIMEOUT" Default="3600" Mode="" Description="Seconds to wait for a transcription (long files on CPU can be slow)" Type="Variable" Display="advanced" Required="false" Mask="false">3600</Config>
+  <Config Name="Uncertainty threshold" Target="UNCERTAINTY_THRESHOLD" Default="0.70" Mode="" Description="Default segment confidence below which a segment is flagged (adjustable in UI)" Type="Variable" Display="advanced" Required="false" Mask="false">0.70</Config>
+  <Config Name="Word threshold" Target="WORD_THRESHOLD" Default="0.45" Mode="" Description="Word probability below which a word is underlined" Type="Variable" Display="advanced" Required="false" Mask="false">0.45</Config>
+  <Config Name="Max upload MB" Target="MAX_UPLOAD_MB" Default="4096" Mode="" Description="Upload size limit" Type="Variable" Display="advanced" Required="false" Mask="false">4096</Config>
+</Container>
