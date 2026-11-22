@@ -1093,7 +1093,7 @@
     drawWave();
   }
   function togglePlay() {
-    if (!audio.getAttribute("src")) return;
+    if (!audio.getAttribute("src") || S.tr) return;
     S.stopAt = null;
     S.resumeAfterTyping = false; clearTimeout(S.typingTimer);
     if (audio.paused) audio.play().catch((e) => toast(e.message, true)); else audio.pause();
@@ -1650,7 +1650,11 @@
       const chip = el("div", "tr-person");
       const dot = el("i"); dot.style.background = personColor(T, p.id);
       const input = el("input"); input.value = p.name; input.placeholder = "Name";
-      input.oninput = () => { p.name = input.value; renderTrainerClips(); renderTrainerCounts(); };
+      input.oninput = () => {
+        p.name = input.value;
+        $("trClips").querySelectorAll(`.tr-tags button[data-pid="${p.id}"]`).forEach((b) => { b.lastChild.textContent = p.name || "?"; });
+        renderTrainerCounts();
+      };
       const rm = el("button", null, "✕"); rm.title = "Remove";
       rm.onclick = () => {
         if (T.people.length <= 2) { toast("You need at least two people"); return; }
@@ -1709,62 +1713,118 @@
     $("trApply").disabled = !ready;
     $("trApply").title = ready ? "" : "Give everyone a unique name and tag at least one clip for each person";
   }
+  /** Build the clip rows once; afterwards rows are updated in place (stable click targets). */
   function renderTrainerClips() {
     const T = S.tr;
     const list = $("trClips");
+    const scroll = list.closest(".modal-body")?.scrollTop;
     list.innerHTML = "";
-    for (const i of T.clips) {
-      const s = S.segs[i];
-      const tag = T.tags.get(i);
-      const li = el("li", "tr-clip" + (tag ? " tagged" : "") + (T.playing === i ? " playing" : ""));
-      if (tag) li.style.setProperty("--tag", personColor(T, tag));
-      li.dataset.i = i;
-      const play = el("button", "tr-play");
-      play.innerHTML = T.playing === i ? STOP_ICON : PLAY_ICON;
-      play.title = "Play this clip";
-      play.onclick = () => (T.playing === i ? (audio.pause(), (S.stopAt = null), trPlaying(null)) : playClip(i));
-      const body = el("div");
-      body.append(el("div", "tr-meta", `${fmt(s.start)} – ${fmt(s.end)}`), el("div", "tr-text", s.text || "(no text)"));
-      const tags = el("div", "tr-tags");
-      for (const p of T.people) {
-        const b = el("button", tag === p.id ? "on" : "");
-        b.style.setProperty("--tag", personColor(T, p.id));
-        const dot = el("i"); dot.style.background = personColor(T, p.id);
-        b.append(dot, document.createTextNode(p.name || "?"));
-        b.onclick = () => {
-          if (tag === p.id) T.tags.delete(i); else T.tags.set(i, p.id);
-          renderTrainerCounts(); renderTrainerClips();
-          if (T.tags.get(i)) playNextUntagged(i);
-        };
-        tags.append(b);
-      }
-      const skip = el("button", "skip", "Skip");
-      skip.title = "Overlapping voices, music or unsure";
-      skip.onclick = () => { T.tags.delete(i); T.clips = T.clips.filter((x) => x !== i); addClips(1); renderTrainerCounts(); renderTrainerClips(); playNextUntagged(i); };
-      tags.append(skip);
-      body.append(tags);
-      li.append(play, body);
-      list.append(li);
+    for (const i of T.clips) list.append(buildClipRow(i));
+    if (scroll != null) list.closest(".modal-body").scrollTop = scroll;
+  }
+  function buildClipRow(i) {
+    const T = S.tr;
+    const s = S.segs[i];
+    const li = el("li", "tr-clip");
+    li.dataset.i = i;
+    const play = el("button", "tr-play");
+    play.type = "button";
+    play.title = "Play this clip (Space)";
+    play.onclick = () => (T.playing === i ? stopClip() : playClip(i));
+    const body = el("div");
+    body.append(el("div", "tr-meta", `${fmt(s.start)} – ${fmt(s.end)}`), el("div", "tr-text", s.text || "(no text)"));
+    const tags = el("div", "tr-tags");
+    for (const p of T.people) {
+      const b = el("button");
+      b.type = "button";
+      b.dataset.pid = p.id;
+      b.style.setProperty("--tag", personColor(T, p.id));
+      const dot = el("i"); dot.style.background = personColor(T, p.id);
+      b.append(dot, document.createTextNode(p.name || "?"));
+      b.onclick = () => tagClip(i, p.id);
+      tags.append(b);
+    }
+    const skip = el("button", "skip", "Skip");
+    skip.type = "button";
+    skip.title = "Overlapping voices, music or unsure";
+    skip.onclick = () => skipClip(i);
+    tags.append(skip);
+    body.append(tags);
+    li.append(play, body);
+    updateClipRow(i, li);
+    return li;
+  }
+  function clipRow(i) { return $("trClips").querySelector(`.tr-clip[data-i="${i}"]`); }
+  function updateClipRow(i, li = clipRow(i)) {
+    const T = S.tr;
+    if (!T || !li) return;
+    const tag = T.tags.get(i);
+    li.classList.toggle("tagged", !!tag);
+    li.classList.toggle("playing", T.playing === i);
+    if (tag) li.style.setProperty("--tag", personColor(T, tag)); else li.style.removeProperty("--tag");
+    li.querySelector(".tr-play").innerHTML = T.playing === i ? STOP_ICON : PLAY_ICON;
+    li.querySelectorAll(".tr-tags button[data-pid]").forEach((b) => b.classList.toggle("on", b.dataset.pid === tag));
+  }
+  function tagClip(i, pid) {
+    const T = S.tr;
+    if (T.tags.get(i) === pid) T.tags.delete(i); else T.tags.set(i, pid);
+    updateClipRow(i);
+    renderTrainerCounts();
+    // Only advance when tagging the clip you're listening to; tagging another clip leaves playback alone.
+    if (T.tags.has(i) && (T.playing === i || (T.playing == null && T.last === i))) playNextUntagged(i);
+  }
+  function skipClip(i) {
+    const T = S.tr;
+    const wasCurrent = T.playing === i || T.last === i;
+    if (T.playing === i) stopClip();
+    T.tags.delete(i);
+    const pos = T.clips.indexOf(i);
+    T.clips = T.clips.filter((x) => x !== i);
+    clipRow(i)?.remove();
+    const before = new Set(T.clips);
+    addClips(1);
+    for (const n of T.clips.filter((x) => !before.has(x))) $("trClips").append(buildClipRow(n));
+    renderTrainerCounts();
+    if (wasCurrent) {
+      const next = T.clips.slice(pos).find((x) => !T.tags.has(x));
+      if (next != null) playClip(next);
     }
   }
   function playClip(i) {
+    const T = S.tr;
     const s = S.segs[i];
-    S.tr.playing = i;
+    const prev = T.playing;
+    T.playing = i;
+    T.last = i;
     S.stopAt = s.end + 0.15;
     audio.currentTime = Math.max(0, s.start - 0.1);
     audio.play().catch(() => {});
-    renderTrainerClips();
-    $("trClips").querySelector(`[data-i="${i}"]`)?.scrollIntoView({ block: "nearest", behavior: "smooth" });
+    if (prev != null && prev !== i) updateClipRow(prev);
+    updateClipRow(i);
+    const row = clipRow(i), body = row?.closest(".modal-body");
+    if (row && body) {  // bring it into view without animating the list under the pointer
+      const r = row.getBoundingClientRect(), b = body.getBoundingClientRect();
+      if (r.top < b.top || r.bottom > b.bottom) row.scrollIntoView({ block: "nearest" });
+    }
+  }
+  function stopClip() {
+    S.stopAt = null;
+    audio.pause();
+    trPlaying(null);
   }
   function playNextUntagged(after) {
     const T = S.tr;
-    const next = T.clips.find((i) => i > after && !T.tags.has(i)) ?? T.clips.find((i) => !T.tags.has(i));
-    if (next != null) playClip(next); else { audio.pause(); S.stopAt = null; trPlaying(null); }
+    const pos = T.clips.indexOf(after);
+    const next = T.clips.slice(pos + 1).find((i) => !T.tags.has(i));
+    if (next != null) playClip(next); else stopClip();
   }
   function trPlaying(i) {
-    if (!S.tr || S.tr.playing === i) return;
-    S.tr.playing = i;
-    renderTrainerClips();
+    const T = S.tr;
+    if (!T || T.playing === i) return;
+    const prev = T.playing;
+    T.playing = i;
+    if (prev != null) updateClipRow(prev);
+    if (i != null) updateClipRow(i);
   }
   async function applyTrainer() {
     const T = S.tr;
@@ -1784,18 +1844,35 @@
   }
   $("teachBtn").onclick = openTrainer;
   $("trClose").onclick = closeTrainer;
-  $("trainer").addEventListener("click", (e) => { if (e.target.id === "trainer") closeTrainer(); });
+  let trDownOnBackdrop = false;
+  $("trainer").addEventListener("mousedown", (e) => { trDownOnBackdrop = e.target.id === "trainer"; });
+  $("trainer").addEventListener("click", (e) => { if (e.target.id === "trainer" && trDownOnBackdrop) closeTrainer(); trDownOnBackdrop = false; });
   $("trAddPerson").onclick = () => {
     if (S.tr.people.length >= 8) return;
     const id = newTrainerId();
     S.tr.people.push({ id, name: `Speaker ${id.slice(1)}` });
     renderTrainer();
   };
-  $("trMore").onclick = () => { addClips(6); renderTrainerClips(); };
+  $("trMore").onclick = () => {
+    const before = new Set(S.tr.clips);
+    addClips(6);
+    for (const n of S.tr.clips.filter((x) => !before.has(x))) $("trClips").append(buildClipRow(n));
+  };
   $("trApply").onclick = applyTrainer;
 
   // ------------------------------------------------------------------ keyboard
   document.addEventListener("keydown", (e) => {
+    if (S.tr) { // Teach dialog open: it owns the keyboard (no shortcuts reach the player behind it)
+      if (e.key === "Escape") { e.preventDefault(); closeTrainer(); return; }
+      if (e.code === "Space" && !e.target.closest("input")) {
+        e.preventDefault();
+        const T = S.tr;
+        if (T.playing != null) stopClip();
+        else if (T.last != null && T.clips.includes(T.last)) playClip(T.last);
+        else { const first = T.clips.find((i) => !T.tags.has(i)) ?? T.clips[0]; if (first != null) playClip(first); }
+      }
+      return;
+    }
     const inField = e.target.closest("input, select, [contenteditable=true]");
     if (e.key === "Escape") { hideSpkMenu(); hideRedMenu(); if (S.tr) closeTrainer(); }
     if ((e.ctrlKey || e.metaKey) && e.code === "Space") { e.preventDefault(); togglePlay(); return; }
