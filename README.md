@@ -9,6 +9,8 @@ A self-hosted web front end for speech-to-text models served through [llama-swap
 - **Speaker detection** (diarization) runs on the CPU inside the container alongside transcription. Rename speakers, reassign a line or a whole turn, add speakers, and re-run detection without losing your text edits.
 - **Edit as you go**: click into any segment and type. *Pause while typing* stops playback while you type and resumes about 1 second earlier once you stop. Edits save automatically.
 - **Uncertainty review**: segments with low model confidence, likely hallucinations (repeated text, implausibly fast speech, transcribed silence), and low-probability words are flagged. They show up in the review panel and as amber regions on the waveform. Jump between them with Alt+N / Alt+P and adjust the sensitivity slider live.
+- **Redaction**: select text and a floating bar offers *Redact*, *Everywhere* (every occurrence in the file) and *+ Mute audio*. It's also on right-click, and Alt+X redacts the selection. Redacted text is removed from the transcript, the word timings and the saved original output, so *Revert edits* can't bring it back. Exports show `[REDACTED]`.
+- **Markers and sections** on the timeline: *+ Marker* or Alt+M adds a point at the playhead, and Shift+drag on the waveform marks a section. Labels show on the waveform and as dividers in the transcript. Drag markers to adjust them. Export them as *Chapters* (`00:12:30 Label`, handy for show notes); they also appear as headings in the text exports.
 - **Split and merge segments** (Alt+S at the cursor, Backspace at the start of a line) to fix boundaries.
 - **Export** as plain text, timestamped text, SRT, WebVTT or JSON, with speaker names included.
 

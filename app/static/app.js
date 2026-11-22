@@ -43,6 +43,7 @@
     voices: [],
     stopAt: null,
     pausedByFocus: false,
+    markers: [],
     ctx: null, // pending redaction target
     tr: null, // trainer state
   };
@@ -317,8 +318,9 @@
     const f = S.files.find((x) => x.id === id);
     if (!f) return;
     S.current = f;
-    S.transcript = null; S.segs = []; S.speakers = {};
+    S.transcript = null; S.segs = []; S.speakers = {}; S.markers = [];
     S.activeIdx = -1; S.activeWord = -1; S.flagCursor = -1; S.peaks = [];
+    renderMarkers();
     history.replaceState(null, "", "#" + id);
     $("emptyState").classList.add("hidden");
     $("workspace").classList.remove("hidden");
@@ -349,6 +351,7 @@
     }
     try { S.peaks = await api(`/api/files/${f.id}/peaks`); } catch { S.peaks = []; }
     drawWave();
+    renderMarkers();
   }
 
   async function loadTranscript() {
@@ -356,8 +359,9 @@
       S.transcript = await api(`/api/files/${S.current.id}/transcript`);
       S.segs = S.transcript.segments;
       S.speakers = S.transcript.speakers || {};
-    } catch { S.transcript = null; S.segs = []; S.speakers = {}; }
-    renderHeader(); renderSegments(); renderSpeakers();
+      S.markers = S.transcript.markers || [];
+    } catch { S.transcript = null; S.segs = []; S.speakers = {}; S.markers = []; }
+    renderHeader(); renderSegments(); renderSpeakers(); renderMarkers();
   }
 
   // ------------------------------------------------------------------ header & progress
@@ -466,8 +470,8 @@
     try {
       clearTimeout(S.saveTimer); S.pendingSave = false;
       S.transcript = await api(`/api/files/${S.current.id}/transcript/revert`, { method: "POST" });
-      S.segs = S.transcript.segments; S.speakers = S.transcript.speakers || {};
-      renderSegments(); renderSpeakers(); toast("Transcript restored");
+      S.segs = S.transcript.segments; S.speakers = S.transcript.speakers || {}; S.markers = S.transcript.markers || [];
+      renderSegments(); renderSpeakers(); renderMarkers(); toast("Transcript restored");
     } catch (e) { toast(e.message, true); }
   };
   $("diarizeBtn").onclick = async () => {
@@ -724,7 +728,17 @@
     }
     const frag = document.createDocumentFragment();
     const hasSpk = Object.keys(S.speakers).length > 0;
+    const mks = sortedMarkers();
+    let mi = 0;
+    const divider = (m) => {
+      const d = el("div", "mk-divider");
+      d.style.setProperty("--mk", m.color);
+      d.append(document.createTextNode(m.label || "Marker"), el("span", "mk-dtime", m.end != null ? `${fmt(m.t)}–${fmt(m.end)}` : fmt(m.t)));
+      d.onclick = () => seekTo(m.t, true);
+      return d;
+    };
     S.segs.forEach((s, i) => {
+      while (mi < mks.length && mks[mi].t <= s.start + 0.05) frag.append(divider(mks[mi++]));
       const turnStart = hasSpk && (i === 0 || S.segs[i - 1].speaker !== s.speaker);
       const row = el("div", "seg" + (turnStart ? " turn" : ""));
       row.dataset.i = i;
@@ -761,6 +775,7 @@
       frag.append(row);
       decorateRow(row, s);
     });
+    while (mi < mks.length) frag.append(divider(mks[mi++]));
     box.append(frag);
     box.scrollTop = scroll;
     renderFlags();
@@ -961,10 +976,12 @@
         ...(s.spk_locked ? { spk_locked: true } : {}), ...(s.spk_conf != null ? { spk_conf: s.spk_conf } : {}),
       })),
       speakers: S.speakers,
+      markers: S.markers.map(({ id, t, end, label, color }) => ({ id, t, end: end ?? null, label, color })),
     };
   }
   async function save() {
-    if (!S.current || !S.pendingSave) return;
+    if (!S.current || !S.pendingSave || !S.transcript) return;
+    if (isBusy(S.current)) { S.saveTimer = setTimeout(save, 2000); return; }
     if (S.saving) { S.saveTimer = setTimeout(save, 300); return; }
     S.saving = true; S.pendingSave = false;
     $("saveState").textContent = "Saving…";
@@ -1187,7 +1204,8 @@
 
     const progress = x(audio.currentTime || 0);
     const bar = 2, gap = 1, n = Math.floor(w / (bar + gap));
-    const mid = h / 2;
+    const lane = S.markers.length ? 16 : 0;
+    const mid = lane + (h - lane) / 2;
     const grad = ctx.createLinearGradient(0, 0, w, 0);
     grad.addColorStop(0, waveColors.a); grad.addColorStop(1, waveColors.b);
     const peaks = S.peaks;
@@ -1197,32 +1215,182 @@
         const a = Math.floor((k / n) * peaks.length), b = Math.max(a + 1, Math.floor(((k + 1) / n) * peaks.length));
         for (let j = a; j < b && j < peaks.length; j++) p = Math.max(p, peaks[j]);
       }
-      const bh = Math.max(1.5, p * (mid - 8));
+      const bh = Math.max(1.5, p * ((h - lane) / 2 - 8));
       const bx = k * (bar + gap);
       ctx.fillStyle = bx < progress ? grad : waveColors.wave;
       ctx.fillRect(bx, mid - bh, bar, bh * 2);
     }
     ctx.fillStyle = waveColors.b;
     ctx.fillRect(progress - 1, 0, 2, h);
+    drawMarkers(w, h, x, lane);
   }
   const waveWrap = $("waveWrap");
-  waveWrap.addEventListener("click", (e) => {
-    const dur = audio.duration || 0; if (!dur) return;
+  const waveDur = () => audio.duration || S.current?.duration || 0;
+  const timeAtX = (clientX) => {
     const r = waveWrap.getBoundingClientRect();
-    seekTo(((e.clientX - r.left) / r.width) * dur);
+    return Math.max(0, Math.min(1, (clientX - r.left) / r.width)) * waveDur();
+  };
+  /** Marker edge under the pointer: {m, edge: "t" | "end"} */
+  function hitMarker(clientX) {
+    const r = waveWrap.getBoundingClientRect(), dur = waveDur();
+    if (!dur) return null;
+    let best = null, bestD = 7;
+    for (const m of S.markers) {
+      for (const edge of m.end != null ? ["t", "end"] : ["t"]) {
+        const d = Math.abs(r.left + (m[edge] / dur) * r.width - clientX);
+        if (d < bestD) { bestD = d; best = { m, edge }; }
+      }
+    }
+    return best;
+  }
+  let wdrag = null;
+  waveWrap.addEventListener("pointerdown", (e) => {
+    if (!waveDur() || e.button !== 0) return;
+    const hit = hitMarker(e.clientX);
+    wdrag = hit ? { type: "move", ...hit, x0: e.clientX, moved: false }
+      : e.shiftKey && canEditMarkers() ? { type: "new", t0: timeAtX(e.clientX), x0: e.clientX, m: null }
+      : { type: "seek" };
+    waveWrap.setPointerCapture(e.pointerId);
   });
-  waveWrap.addEventListener("mousemove", (e) => {
-    const dur = audio.duration || 0; if (!dur) return;
+  waveWrap.addEventListener("pointermove", (e) => {
+    const dur = waveDur(); if (!dur) return;
     const r = waveWrap.getBoundingClientRect();
-    const t = ((e.clientX - r.left) / r.width) * dur;
+    const t = timeAtX(e.clientX);
     const hov = $("waveHover");
     hov.style.left = e.clientX - r.left + "px";
     const i = findSeg(t);
     const spk = S.segs[i]?.speaker && t <= S.segs[i].end + 0.5 ? " · " + spkName(S.segs[i].speaker) : "";
-    hov.textContent = fmt(t) + spk;
+    const near = hitMarker(e.clientX);
+    hov.textContent = fmt(t) + spk + (near ? ` · ${near.m.label || "Marker"}` : "");
+    waveWrap.classList.toggle("grab", !!near || !!(wdrag && wdrag.type !== "seek"));
+    if (!wdrag) return;
+    if (wdrag.type === "move" && Math.abs(e.clientX - wdrag.x0) > 2) {
+      wdrag.moved = true;
+      const m = wdrag.m;
+      if (wdrag.edge === "t") m.t = m.end != null ? Math.min(t, m.end - 0.2) : t;
+      else m.end = Math.max(t, m.t + 0.2);
+      drawWave();
+    } else if (wdrag.type === "new" && Math.abs(e.clientX - wdrag.x0) > 4) {
+      if (!wdrag.m) { wdrag.m = newMarker(wdrag.t0, wdrag.t0 + 0.2, "#ef4444"); S.markers.push(wdrag.m); }
+      wdrag.m.t = Math.min(wdrag.t0, t); wdrag.m.end = Math.max(wdrag.t0, t);
+      drawWave();
+    }
   });
+  waveWrap.addEventListener("pointerup", (e) => {
+    const d = wdrag; wdrag = null;
+    if (!d || !waveDur()) return;
+    if (d.type === "seek") seekTo(timeAtX(e.clientX));
+    else if (d.type === "move") {
+      if (d.moved) { markersChanged(); } else seekTo(d.m[d.edge]);
+    } else if (d.type === "new") {
+      if (d.m) { markersChanged(d.m); }
+      else { const m = newMarker(d.t0, null); S.markers.push(m); markersChanged(m); }
+    }
+  });
+  waveWrap.addEventListener("pointerleave", () => { if (!wdrag) waveWrap.classList.remove("grab"); });
   new ResizeObserver(() => drawWave()).observe(waveWrap);
   matchMedia("(prefers-color-scheme: light)").addEventListener("change", () => { waveColors = null; drawWave(); });
+
+  // ------------------------------------------------------------------ markers
+  const MK_COLORS = ["#22c55e", "#ef4444", "#f59e0b", "#3b82f6", "#a855f7", "#ec4899", "#14b8a6"];
+  const sortedMarkers = () => [...S.markers].sort((a, b) => a.t - b.t);
+  function newMarker(t, end, color) {
+    return { id: Math.random().toString(36).slice(2, 10), t, end: end ?? null, label: "", color: color || MK_COLORS[0] };
+  }
+  /** Save, redraw and (optionally) focus the label input of `focus`. */
+  function markersChanged(focus) {
+    S.markers.sort((a, b) => a.t - b.t);
+    queueSave();
+    renderMarkers();
+    renderSegments();
+    drawWave();
+    if (focus) {
+      const input = $("markerList").querySelector(`[data-id="${focus.id}"] input`);
+      if (input) { input.focus(); input.select(); }
+    }
+  }
+  function canEditMarkers() {
+    if (S.current && S.transcript && !isBusy(S.current)) return true;
+    toast(S.current && isBusy(S.current) ? "Markers can be added when the current job finishes" : "Markers can be added once there's a transcript");
+    return false;
+  }
+  function addMarkerAtPlayhead() {
+    if (!S.current || !waveDur() || !canEditMarkers()) return;
+    const m = newMarker(audio.currentTime || 0, null);
+    S.markers.push(m);
+    markersChanged(m);
+  }
+  function drawMarkers(w, h, x, lane) {
+    if (!S.markers.length) return;
+    ctx.save();
+    ctx.font = "600 10.5px Inter, system-ui, sans-serif";
+    ctx.textBaseline = "middle";
+    for (const m of sortedMarkers()) {
+      const x0 = x(m.t);
+      if (m.end != null) {
+        const x1 = x(m.end);
+        ctx.globalAlpha = 0.12; ctx.fillStyle = m.color; ctx.fillRect(x0, lane, x1 - x0, h - lane);
+        ctx.globalAlpha = 1; ctx.strokeStyle = m.color; ctx.lineWidth = 2; ctx.setLineDash([6, 4]);
+        ctx.strokeRect(x0 + 1, lane + 1, Math.max(2, x1 - x0 - 2), h - lane - 2);
+        ctx.setLineDash([]);
+        ctx.fillStyle = m.color; ctx.fillRect(x0 - 1, lane, 3, h - lane); ctx.fillRect(x1 - 2, lane, 3, h - lane);
+      } else {
+        ctx.fillStyle = m.color; ctx.fillRect(x0 - 1, lane, 3, h - lane);
+      }
+      // label tag in the top lane
+      const text = (m.label || "Marker").slice(0, 40);
+      const tw = Math.min(ctx.measureText(text).width + 10, Math.max(30, w - x0 - 2));
+      const tx = Math.min(x0 - 1, w - tw);
+      ctx.fillStyle = m.color;
+      ctx.beginPath(); ctx.roundRect ? ctx.roundRect(tx, 0, tw, 14, 4) : ctx.rect(tx, 0, tw, 14); ctx.fill();
+      ctx.fillStyle = "#fff";
+      ctx.save(); ctx.beginPath(); ctx.rect(tx, 0, tw, 14); ctx.clip();
+      ctx.fillText(text, tx + 5, 7.5);
+      ctx.restore();
+    }
+    ctx.restore();
+  }
+  function renderMarkers() {
+    const card = $("markersCard");
+    card.classList.toggle("hidden", !S.current || !S.current.duration);
+    const list = $("markerList");
+    list.innerHTML = "";
+    $("markerCount").textContent = S.markers.length || "";
+    if (!S.markers.length) {
+      list.append(el("li", "muted", "No markers yet. Press + Marker or Alt+M while listening."));
+      return;
+    }
+    for (const m of sortedMarkers()) {
+      const li = el("li");
+      li.dataset.id = m.id;
+      const sw = el("button", "mk-color"); sw.style.background = m.color; sw.title = "Change color";
+      sw.onclick = () => { m.color = MK_COLORS[(MK_COLORS.indexOf(m.color) + 1) % MK_COLORS.length]; markersChanged(); };
+      const time = el("button", "mk-time", m.end != null ? `${fmt(m.t)}–${fmt(m.end)}` : fmt(m.t));
+      time.title = "Jump here";
+      time.onclick = () => seekTo(m.t, true);
+      const input = el("input"); input.value = m.label; input.placeholder = m.end != null ? "Section label" : "Marker label";
+      input.oninput = () => { m.label = input.value; drawWave(); queueSave(); };
+      input.onchange = () => renderSegments();
+      input.onkeydown = (e) => { if (e.key === "Enter" || e.key === "Escape") input.blur(); };
+      const acts = el("div", "mk-actions");
+      if (m.end != null) {
+        const play = el("button", null, "▶"); play.title = "Play this section";
+        play.onclick = () => { seekTo(m.t); S.stopAt = m.end; audio.play().catch(() => {}); };
+        acts.append(play);
+      } else {
+        const here = el("button", null, "⇥"); here.title = "Move marker to the playhead";
+        here.onclick = () => { m.t = audio.currentTime || 0; markersChanged(); };
+        acts.append(here);
+      }
+      const del = el("button", "del", "✕"); del.title = "Delete marker";
+      del.onclick = () => { S.markers = S.markers.filter((x) => x !== m); markersChanged(); };
+      acts.append(del);
+      li.append(sw, time, input, acts);
+      list.append(li);
+    }
+  }
+  $("addMarkerBtn").onclick = addMarkerAtPlayhead;
+  $("addMarker2").onclick = addMarkerAtPlayhead;
 
   // ------------------------------------------------------------------ redaction
   /** The current text selection if it lies inside one segment: {i, phrase, offset}. */
@@ -1321,7 +1489,7 @@
         method: "POST",
         body: JSON.stringify({ phrase: target.phrase, segment_id: everywhere ? null : seg.id, offset: target.offset, mute_audio: mute }),
       });
-      S.transcript = r.transcript; S.segs = r.transcript.segments; S.speakers = r.transcript.speakers || {};
+      S.transcript = r.transcript; S.segs = r.transcript.segments; S.speakers = r.transcript.speakers || {}; S.markers = r.transcript.markers || S.markers;
       renderSegments(); renderSpeakers();
       $("saveState").textContent = "All changes saved";
       toast(`Redacted ${r.count} occurrence${r.count === 1 ? "" : "s"}${r.muted ? " and muted the audio" : ""}`);
@@ -1541,6 +1709,7 @@
         Comma: () => seekTo(audio.currentTime - 5),
         Period: () => seekTo(audio.currentTime + 5),
         KeyX: () => redactSelection(false, false),
+        KeyM: () => addMarkerAtPlayhead(),
         KeyN: () => nextFlag(1),
         KeyP: () => nextFlag(-1),
         KeyR: () => {

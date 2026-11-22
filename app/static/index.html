@@ -89,6 +89,7 @@
           <div><kbd>Backspace</kbd> at start merges with previous</div>
           <div>Select text + right-click (or <kbd>Alt</kbd>+<kbd>X</kbd>) to redact</div>
           <div><kbd>Esc</kbd> leave a line and resume playback</div>
+          <div><kbd>Alt</kbd>+<kbd>M</kbd> add marker · <kbd>Shift</kbd>+drag waveform for a section</div>
         </div>
       </section>
 
@@ -108,7 +109,8 @@
                 <button data-fmt="timestamps"><b>With timestamps</b><small>[00:01:23 - 00:01:27] text</small></button>
                 <button data-fmt="srt"><b>SRT subtitles</b><small>.srt</small></button>
                 <button data-fmt="vtt"><b>WebVTT</b><small>.vtt</small></button>
-                <button data-fmt="json"><b>JSON</b><small>segments + confidence</small></button>
+                <button data-fmt="chapters"><b>Chapters</b><small>marker list, e.g. for podcast show notes</small></button>
+                <button data-fmt="json"><b>JSON</b><small>segments + confidence + markers</small></button>
               </div>
             </div>
             <div class="menu">
@@ -134,6 +136,7 @@
             <button class="ctl play" id="playBtn" title="Play / pause (Ctrl+Space)"><svg viewBox="0 0 24 24" id="playIcon"><path d="M8 5v14l11-7z"/></svg></button>
             <button class="ctl" id="fwdBtn" title="Forward 5s (Alt+.)"><svg viewBox="0 0 24 24"><path d="m13 6 6 6-6 6M5 6l6 6-6 6"/></svg></button>
             <div class="time"><span id="curTime">0:00</span><span class="muted"> / </span><span id="durTime" class="muted">0:00</span></div>
+            <button class="btn sm" id="addMarkerBtn" title="Add a marker at the playhead (Alt+M). Shift+drag on the waveform to mark a section.">+ Marker</button>
             <div class="spacer"></div>
             <label class="field compact"><span>Speed</span>
               <select id="rateSelect">
@@ -170,6 +173,13 @@
           </div>
 
           <aside class="side">
+          <section class="markers card hidden" id="markersCard">
+            <div class="card-head"><span>Markers <b id="markerCount" class="badge mk"></b></span>
+              <button class="btn icon sm" id="addMarker2" title="Add marker at playhead (Alt+M)">+</button>
+            </div>
+            <ul class="marker-list" id="markerList"></ul>
+            <div class="mk-hint">Shift+drag on the waveform to mark a section. Drag a marker to move it.</div>
+          </section>
           <section class="speakers card hidden" id="speakersCard">
             <div class="card-head"><span>Speakers</span>
               <div class="nav">

@@ -257,7 +257,9 @@ async def job_transcribe(fid: str, opts: dict) -> None:
             speakers = name_from_voices(asr.assign_speakers(words, turns), cents)
         segments = asr.build_segments(words)
         asr.score_segments(segments)
+        prev = read_json(d / "transcript.json") or {}
         transcript = {"model": result["model"], "api": result["api"], "created": time.time(),
+                      "markers": prev.get("markers") or [],
                       "duration": meta.get("duration"), "speakers": speakers, "segments": segments,
                       "timing": "estimated" if any(w.get("est") for w in words) else "model"}
         write_json(d / "transcript.orig.json", transcript)
@@ -580,6 +582,7 @@ async def get_transcript(fid: str) -> dict:
     if t is None:
         raise HTTPException(404, "No transcript yet")
     t.setdefault("speakers", {})
+    t.setdefault("markers", [])
     return t
 
 
@@ -590,10 +593,33 @@ SEG_KEYS = {"id", "start", "end", "text", "speaker", "words", "reviewed", "edite
 class TranscriptIn(BaseModel):
     segments: list[dict]
     speakers: Optional[dict] = None
+    markers: Optional[list[dict]] = None
+
+
+COLOR_RE = re.compile(r"^#[0-9a-fA-F]{6}$")
+
+
+def clean_markers(items: list[dict]) -> list[dict]:
+    out = []
+    for m in items[:500]:
+        try:
+            t = max(0.0, float(m["t"]))
+            end = float(m["end"]) if m.get("end") is not None else None
+        except (KeyError, TypeError, ValueError):
+            continue
+        if end is not None and end <= t:
+            end = None
+        color = str(m.get("color") or "")
+        out.append({"id": str(m.get("id") or uuid.uuid4().hex[:10])[:20], "t": round(t, 3),
+                    "end": round(end, 3) if end is not None else None,
+                    "label": str(m.get("label") or "")[:120], "color": color if COLOR_RE.match(color) else "#22c55e"})
+    return sorted(out, key=lambda m: m["t"])
 
 
 @app.put("/api/files/{fid}/transcript")
 async def save_transcript(fid: str, body: TranscriptIn) -> dict:
+    if load_meta(fid)["status"] in ACTIVE_STATES:
+        raise HTTPException(409, "A job is running on this file; changes will be saved when it finishes")
     path = fdir(fid) / "transcript.json"
     t = read_json(path)
     if t is None:
@@ -608,6 +634,8 @@ async def save_transcript(fid: str, body: TranscriptIn) -> dict:
         except (KeyError, TypeError, ValueError):
             raise HTTPException(422, "Invalid segment") from None
     t["segments"] = sorted(segs, key=lambda s: s["start"])
+    if body.markers is not None:
+        t["markers"] = clean_markers(body.markers)
     if body.speakers is not None:
         t["speakers"] = {str(k): {"name": str((v or {}).get("name", k))[:80],
                                   **({"voice": v["voice"]} if (v or {}).get("voice") else {})}
@@ -623,6 +651,7 @@ async def revert_transcript(fid: str) -> dict:
     orig = read_json(d / "transcript.orig.json")
     if orig is None:
         raise HTTPException(404, "No original transcript")
+    orig["markers"] = (read_json(d / "transcript.json") or {}).get("markers") or []
     write_json(d / "transcript.json", orig)
     orig.setdefault("speakers", {})
     return orig
@@ -749,6 +778,21 @@ def ts(sec: float, sep: str = ".", ms: bool = True) -> str:
 def render_export(t: dict, fmt: str) -> tuple[str, str, str]:
     segs = [s for s in t["segments"] if s["text"].strip()]
     names = {k: v.get("name") or k for k, v in (t.get("speakers") or {}).items()}
+    markers = sorted(t.get("markers") or [], key=lambda m: m["t"])
+
+    def marker_label(m: dict) -> str:
+        return m.get("label") or "Marker"
+
+    def headings_before(start: float, done: set) -> list[dict]:
+        """Markers that fall before this segment's start and haven't been emitted yet."""
+        out = [m for m in markers if m["id"] not in done and m["t"] <= start + 0.05]
+        done.update(m["id"] for m in out)
+        return out
+
+    if fmt == "chapters":
+        lines = [f"{ts(m['t'], ms=False)} {marker_label(m)}" + (f" (until {ts(m['end'], ms=False)})" if m.get("end") else "")
+                 for m in markers]
+        return ("\n".join(lines) + "\n") if lines else "No markers in this file.\n", "chapters.txt", "text/plain"
 
     def who(s: dict) -> Optional[str]:
         return names.get(s.get("speaker") or "", None)
@@ -757,7 +801,14 @@ def render_export(t: dict, fmt: str) -> tuple[str, str, str]:
         paras: list[str] = []
         cur: list[str] = []
         last_end, last_spk = None, object()
+        done: set = set()
         for s in segs:  # new paragraph on speaker change or long pause
+            for m in headings_before(s["start"], done):
+                if cur:
+                    paras.append(" ".join(cur))
+                    cur = []
+                paras.append(f"## {marker_label(m)} [{ts(m['t'], ms=False)}]")
+                last_spk = object()
             spk = who(s)
             if cur and (spk != last_spk or (last_end is not None and s["start"] - last_end > 2.0)):
                 paras.append(" ".join(cur))
@@ -770,9 +821,14 @@ def render_export(t: dict, fmt: str) -> tuple[str, str, str]:
             paras.append(" ".join(cur))
         return "\n\n".join(paras) + "\n", "txt", "text/plain"
     if fmt == "timestamps":
-        lines = [f"[{ts(s['start'], ms=False)} - {ts(s['end'], ms=False)}] "
-                 f"{who(s) + ': ' if who(s) else ''}{s['text'].strip()}" for s in segs]
-        return "\n".join(lines) + "\n", "timestamps.txt", "text/plain"
+        lines = []
+        done = set()
+        for s in segs:
+            for m in headings_before(s["start"], done):
+                lines.append(f"\n=== {marker_label(m)} [{ts(m['t'], ms=False)}] ===")
+            lines.append(f"[{ts(s['start'], ms=False)} - {ts(s['end'], ms=False)}] "
+                         f"{who(s) + ': ' if who(s) else ''}{s['text'].strip()}")
+        return "\n".join(lines).lstrip("\n") + "\n", "timestamps.txt", "text/plain"
     if fmt == "srt":
         blocks = [f"{i}\n{ts(s['start'], ',')} --> {ts(s['end'], ',')}\n"
                   f"{'[' + who(s) + '] ' if who(s) else ''}{s['text'].strip()}\n" for i, s in enumerate(segs, 1)]
@@ -783,6 +839,7 @@ def render_export(t: dict, fmt: str) -> tuple[str, str, str]:
         return "WEBVTT\n\n" + "\n".join(blocks), "vtt", "text/vtt"
     if fmt == "json":
         out = {"model": t.get("model"), "speakers": names,
+               "markers": [{"time": m["t"], "end": m.get("end"), "label": m.get("label")} for m in markers],
                "segments": [{"start": s["start"], "end": s["end"], "speaker": who(s), "text": s["text"].strip(),
                              "confidence": s.get("confidence"), "reviewed": s.get("reviewed", False)}
                             for s in segs]}
