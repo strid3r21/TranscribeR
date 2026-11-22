@@ -3,15 +3,23 @@
 A self-hosted web front end for speech-to-text models served through [llama-swap](https://github.com/mostlygeek/llama-swap). It's built to run as a Docker container on Unraid.
 
 - **Upload anything ffmpeg can read** (drag and drop, multiple files, video too). Files that aren't already MP3 are converted to constant-bitrate MP3 so seeking in the browser lands on the right spot.
-- **File library** with status, duration and rename/delete.
-- **Synced transcript**: the current segment and word highlight as the audio plays, and you can click any timestamp (or Alt+click a word) to jump there.
+- **File library** with status and duration. Rename files, delete them one at a time or in bulk, or delete just the audio to free space while keeping the transcript.
+- **Long files just work**: audio is split at natural pauses into ~30 s chunks, transcribed one after another and stitched back together, so a 90-minute recording never exceeds the model's context window. If a chunk is still too large, it is halved and retried automatically.
+- **Follow along**: words light up karaoke-style as the audio plays (spoken words bright, the current word boxed). Click any timestamp, or Alt+click a word, to jump there.
+- **Speaker detection** (diarization) runs on the CPU inside the container alongside transcription. Rename speakers, reassign a line or a whole turn, add speakers, and re-run detection without losing your text edits.
 - **Edit as you go**: click into any segment and type. *Pause while typing* stops playback while you type and resumes about 1 second earlier once you stop. Edits save automatically.
 - **Uncertainty review**: segments with low model confidence, likely hallucinations (repeated text, implausibly fast speech, transcribed silence), and low-probability words are flagged. They show up in the review panel and as amber regions on the waveform. Jump between them with Alt+N / Alt+P and adjust the sensitivity slider live.
-- **Export** as plain text, timestamped text, SRT, WebVTT or JSON.
+- **Split and merge segments** (Alt+S at the cursor, Backspace at the start of a line) to fix boundaries.
+- **Export** as plain text, timestamped text, SRT, WebVTT or JSON, with speaker names included.
 
 ## How it talks to llama-swap
 
-TranscribeR calls the OpenAI-compatible `POST {LLAMA_SWAP_URL}/v1/audio/transcriptions` with `response_format=verbose_json` and word timestamps. llama-swap routes the request by the `model` field, so any model in your llama-swap config shows up in the model dropdown (from `/v1/models`). If a backend rejects those options, TranscribeR retries with simpler ones.
+Any model in your llama-swap config shows up in the model dropdown (from `/v1/models`). llama-swap routes each request by its `model` field. TranscribeR picks the API per model:
+
+- **Audio LLMs on llama-server** (for example NVIDIA Nemotron Transcribe, where `/v1/models` lists `audio` in `input_modalities`) are called through `/v1/chat/completions` with the chunk as `input_audio` and `logprobs: true`. This returns per-token probabilities, which become per-word confidence and drive the uncertainty flags. These models don't return timestamps, so word times are estimated: each chunk's words are aligned to the speech between pauses, and to speaker changes when speaker detection is on. Sentence boundaries usually land within a few tenths of a second.
+- **Everything else** (whisper.cpp, faster-whisper, …) gets `POST /v1/audio/transcriptions` with `response_format=verbose_json` and word timestamps, falling back to plain `json` if the backend rejects that.
+
+Set `TRANSCRIBE_API=transcriptions` or `chat` to force one or the other.
 
 Example llama-swap entry for whisper.cpp:
 
@@ -26,7 +34,11 @@ models:
       --request-path /v1/audio/transcriptions --inference-path ""
 ```
 
-Confidence flags work best when the backend returns per-word `probability` (whisper.cpp and faster-whisper do). Without it, TranscribeR falls back to `avg_logprob` per segment. If there's neither, you get a plain transcript with no flags.
+Confidence flags need per-word or per-token probabilities. Chat mode and whisper.cpp/faster-whisper provide them; with only `avg_logprob`, TranscribeR uses that per segment. A model that returns plain text through `/v1/audio/transcriptions` gives you a transcript without confidence flags. Repetition and hallucination checks still apply.
+
+### Speaker detection
+
+Diarization uses [sherpa-onnx](https://github.com/k2-fsa/sherpa-onnx) with the pyannote segmentation 3.0 model and NeMo TitaNet-small speaker embeddings (about 45 MB, baked into the image). It runs on the CPU at roughly 15× real time with 4 threads, so a 90-minute file takes about 6 minutes and runs at the same time as GPU transcription. Choose *Auto* or a fixed speaker count in the top bar. A fixed count is more reliable when you know it (for example 2 for an interview).
 
 ## Install on Unraid
 
@@ -64,7 +76,14 @@ See `docker-compose.yml` for the same setup as a compose file.
 | `DEFAULT_LANGUAGE` | auto | ISO language code |
 | `AUTO_TRANSCRIBE` | `true` | Default state of the auto-transcribe toggle |
 | `UPSTREAM_FORMAT` | `mp3` | Set to `wav` (16 kHz mono) if your backend can't decode MP3 |
-| `REQUEST_TIMEOUT` | `3600` | Seconds to wait for one transcription |
+| `CHUNK_SECONDS` | `30` | Target chunk length; cuts land on the nearest pause. `0` sends the whole file |
+| `CHUNK_CONCURRENCY` | `1` | Chunks in flight at once (raise only if llama-server runs with `--parallel`) |
+| `TRANSCRIBE_API` | `auto` | `auto`, `chat` or `transcriptions` |
+| `CHAT_PROMPT` | `Transcribe the speech in this audio verbatim. Output only the transcript text.` | Instruction sent with each chunk in chat mode. Without one, some audio LLMs describe the audio instead of transcribing it |
+| `DIARIZATION` | `auto` | Default for the Speakers selector: `off`, `auto` or a number |
+| `DIARIZE_THREADS` | `4` | CPU threads for speaker detection |
+| `DIARIZE_THRESHOLD` | `0.7` | Clustering threshold in *Auto* mode (higher = fewer speakers) |
+| `REQUEST_TIMEOUT` | `1800` | Seconds to wait for one chunk |
 | `UNCERTAINTY_THRESHOLD` | `0.70` | Default flag threshold (the UI slider overrides it per browser) |
 | `WORD_THRESHOLD` | `0.45` | Words below this probability get underlined |
 | `MP3_BITRATE` | `128k` | Bitrate for converted files |
@@ -86,6 +105,8 @@ Jobs run one at a time so llama-swap isn't asked to swap models mid-job. Queued 
 | Alt+N / Alt+P | Next / previous flagged segment |
 | Alt+R | Mark the current segment reviewed (and jump to the next flag) |
 | Enter (while editing) | Move to the next segment |
+| Alt+S (while editing) | Split the segment at the cursor |
+| Backspace at the start of a segment | Merge it into the previous one |
 | Alt+click a word | Play from that word |
 
 ## Development

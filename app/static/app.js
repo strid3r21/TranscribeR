@@ -13,15 +13,18 @@
     get(k, d) { try { const v = localStorage.getItem("tr." + k); return v == null ? d : JSON.parse(v); } catch { return d; } },
     set(k, v) { try { localStorage.setItem("tr." + k, JSON.stringify(v)); } catch { /* ignore */ } },
   };
+  const SPK_COLORS = ["#7c6cff", "#22c3d8", "#f472b6", "#34d399", "#fb923c", "#60a5fa", "#e5b80b", "#a78bfa", "#f87171", "#84cc16"];
 
   const S = {
     config: null,
     files: [],
-    uploads: new Map(), // temp id -> {name, progress}
-    current: null,      // file meta
+    uploads: new Map(),
+    current: null,
     transcript: null,
     segs: [],
+    speakers: {},
     activeIdx: -1,
+    activeWord: -1,
     flagged: [],
     flagCursor: -1,
     threshold: 0.7,
@@ -33,7 +36,10 @@
     typingTimer: null,
     resumeAfterTyping: false,
     search: "",
-    lastWordEl: null,
+    selectMode: false,
+    selected: new Set(),
+    spkTarget: null,
+    spkScope: "seg",
   };
 
   const audio = $("audio");
@@ -75,6 +81,9 @@
     return res.status === 204 ? null : res.json();
   }
   const cssVar = (n) => getComputedStyle(document.documentElement).getPropertyValue(n).trim();
+  const svg = (paths) => { const s = document.createElementNS("http://www.w3.org/2000/svg", "svg"); s.setAttribute("viewBox", "0 0 24 24"); s.innerHTML = paths; return s; };
+  const ICON_FILE = '<path d="M9 18V5l12-2v13"/><circle cx="6" cy="18" r="3"/><circle cx="18" cy="16" r="3"/>';
+  const ICON_TRASH = '<path d="M4 7h16M10 11v6M14 11v6M6 7l1 12a2 2 0 0 0 2 2h6a2 2 0 0 0 2-2l1-12M9 7V4h6v3"/>';
 
   // ------------------------------------------------------------------ config
   async function loadConfig() {
@@ -86,12 +95,15 @@
       S.wordThreshold = c.word_threshold;
       const sel = $("modelSelect");
       const saved = store.get("model", c.default_model);
-      const models = c.models.length ? c.models : [c.default_model];
-      if (!models.includes(saved) && saved) models.unshift(saved);
+      const models = c.models.length ? c.models.slice() : [c.default_model];
+      if (saved && !models.includes(saved)) models.unshift(saved);
       sel.innerHTML = "";
       for (const m of models) sel.append(new Option(m, m, false, m === saved));
       $("languageInput").value = store.get("language", c.default_language || "");
       $("autoToggle").checked = store.get("auto", c.auto_transcribe);
+      $("speakersField").classList.toggle("hidden", !c.diarization_available);
+      const spk = store.get("speakers", c.diarization_default || "auto");
+      $("speakersSelect").value = [...$("speakersSelect").options].some((o) => o.value === spk) ? spk : "auto";
       $("threshold").value = S.threshold;
       $("thresholdVal").textContent = Math.round(S.threshold * 100) + "%";
       if (c.backend_error) {
@@ -113,44 +125,37 @@
   $("modelSelect").onchange = (e) => store.set("model", e.target.value);
   $("languageInput").onchange = (e) => store.set("language", e.target.value.trim());
   $("autoToggle").onchange = (e) => store.set("auto", e.target.checked);
+  $("speakersSelect").onchange = (e) => store.set("speakers", e.target.value);
   $("backendStatus").onclick = loadConfig;
 
   function transcribeOpts() {
     const o = { model: $("modelSelect").value || undefined };
     const lang = $("languageInput").value.trim();
     if (lang) o.language = lang;
+    if (S.config?.diarization_available) o.speakers = $("speakersSelect").value;
     return o;
   }
 
   // ------------------------------------------------------------------ files
-  const STATUS_LABEL = { processing: "Converting", ready: "Ready", queued: "Queued", transcribing: "Transcribing", done: "Transcribed", error: "Error" };
-  const isBusy = (f) => ["processing", "queued", "transcribing"].includes(f.status);
+  const STATUS_LABEL = { processing: "Converting", ready: "Ready", queued: "Queued", transcribing: "Transcribing", diarizing: "Finding speakers", done: "Transcribed", error: "Error" };
+  const isBusy = (f) => ["processing", "queued", "transcribing", "diarizing"].includes(f.status);
 
   async function loadFiles() {
-    try {
-      S.files = await api("/api/files");
-    } catch (e) { return; }
+    try { S.files = await api("/api/files"); } catch { return; }
+    for (const id of [...S.selected]) if (!S.files.some((f) => f.id === id)) S.selected.delete(id);
     renderFiles();
-    if (S.current) {
-      const f = S.files.find((x) => x.id === S.current.id);
-      if (!f) { closeFile(); return; }
-      const prevStatus = S.current.status;
-      S.current = f;
-      renderHeader();
-      if (prevStatus !== f.status && !S.segs.length) renderSegments();
-      if (prevStatus !== "done" && f.status === "done") {
-        await loadTranscript();
-        toast("Transcription finished");
-      }
-      if (prevStatus === "processing" && f.status !== "processing" && f.status !== "error") loadAudio();
+    if (!S.current) return;
+    const f = S.files.find((x) => x.id === S.current.id);
+    if (!f) { closeFile(); return; }
+    const prev = S.current;
+    S.current = f;
+    renderHeader();
+    if (prev.status !== f.status && !S.segs.length) renderSegments();
+    if (isBusy(prev) && !isBusy(f) && f.has_transcript) {
+      await loadTranscript();
+      if (f.status === "done") toast(prev.status === "diarizing" ? "Speakers updated" : "Transcription finished");
     }
-  }
-
-  function fileIcon() {
-    const s = document.createElementNS("http://www.w3.org/2000/svg", "svg");
-    s.setAttribute("viewBox", "0 0 24 24");
-    s.innerHTML = '<path d="M9 18V5l12-2v13"/><circle cx="6" cy="18" r="3"/><circle cx="18" cy="16" r="3"/>';
-    return s;
+    if (prev.status === "processing" && f.status !== "processing") loadAudio();
   }
 
   function renderFiles() {
@@ -158,38 +163,85 @@
     list.innerHTML = "";
     for (const [tid, u] of S.uploads) {
       const li = el("li", "file");
-      const ic = el("div", "ficon"); ic.append(fileIcon());
+      const ic = el("div", "ficon"); ic.append(svg(ICON_FILE));
       const body = el("div");
       body.append(el("div", "fname", u.name));
       const sub = el("div", "fsub");
-      const p = el("span", "pill busy", u.progress < 1 ? `Uploading ${Math.round(u.progress * 100)}%` : "Finishing upload");
-      sub.append(p);
+      sub.append(el("span", "pill busy", u.progress < 1 ? `Uploading ${Math.round(u.progress * 100)}%` : "Finishing upload"));
       body.append(sub);
       const bar = el("div", "progress"); bar.style.width = u.progress * 100 + "%";
-      li.append(ic, body, bar);
+      li.append(ic, body, el("span"), bar);
       li.dataset.tid = tid;
       list.append(li);
     }
     for (const f of S.files) {
-      const li = el("li", "file" + (S.current && S.current.id === f.id ? " active" : ""));
-      const ic = el("div", "ficon"); ic.append(fileIcon());
+      const sel = S.selected.has(f.id);
+      const li = el("li", "file" + (S.current && S.current.id === f.id ? " active" : "") + (sel ? " selected" : ""));
+      let lead;
+      if (S.selectMode) {
+        lead = el("label", "fcheck");
+        const cb = el("input"); cb.type = "checkbox"; cb.checked = sel;
+        cb.onclick = (e) => e.stopPropagation();
+        cb.onchange = () => { cb.checked ? S.selected.add(f.id) : S.selected.delete(f.id); renderFiles(); };
+        lead.append(cb);
+      } else { lead = el("div", "ficon"); lead.append(svg(ICON_FILE)); }
       const body = el("div");
+      body.style.minWidth = "0";
       body.append(el("div", "fname", f.name));
       body.title = f.name;
       const sub = el("div", "fsub");
       let label = STATUS_LABEL[f.status] || f.status;
-      if (f.status === "transcribing" && f.elapsed != null) label += " " + fmt(f.elapsed);
+      if (f.status === "transcribing" && f.progress?.total) label += ` ${f.progress.done || 0}/${f.progress.total}`;
+      else if (isBusy(f) && f.elapsed != null) label += " " + fmt(f.elapsed);
       const cls = f.status === "done" ? "done" : f.status === "error" ? "error" : isBusy(f) ? "busy" : "";
       sub.append(el("span", "pill " + cls, label));
+      if (f.audio_deleted) sub.append(el("span", "pill gone", "no audio"));
       if (f.duration) sub.append(el("span", null, fmt(f.duration)));
-      if (f.converted) sub.append(el("span", null, "→ mp3"));
+      if (f.speaker_count > 1) sub.append(el("span", null, `${f.speaker_count} speakers`));
       body.append(sub);
-      li.append(ic, body);
-      li.onclick = () => openFile(f.id);
+      const del = el("button", "fdel"); del.title = "Delete"; del.append(svg(ICON_TRASH));
+      del.onclick = (e) => { e.stopPropagation(); deleteFiles([f.id]); };
+      li.append(lead, body, S.selectMode ? el("span") : del);
+      li.onclick = () => {
+        if (S.selectMode) { sel ? S.selected.delete(f.id) : S.selected.add(f.id); renderFiles(); }
+        else openFile(f.id);
+      };
       list.append(li);
     }
     $("fileCount").textContent = S.files.length ? S.files.length : "";
+    $("selectToggle").textContent = S.selectMode ? "Done" : "Select";
+    $("bulkBar").classList.toggle("hidden", !S.selectMode);
+    $("bulkCount").textContent = `${S.selected.size} selected`;
+    $("bulkDelete").disabled = $("bulkAudio").disabled = !S.selected.size;
   }
+
+  // ---- deletion
+  async function deleteFiles(ids, audioOnly = false) {
+    if (!ids.length) return;
+    const names = ids.map((id) => S.files.find((f) => f.id === id)?.name || id);
+    const what = ids.length === 1 ? `"${names[0]}"` : `${ids.length} files`;
+    const msg = audioOnly
+      ? `Delete the audio for ${what}? Transcripts are kept and can still be edited and downloaded.`
+      : `Delete ${what}? This removes the audio and the transcript.`;
+    if (!confirm(msg)) return;
+    if (S.current && ids.includes(S.current.id)) { clearTimeout(S.saveTimer); if (!audioOnly) S.pendingSave = false; else await flushSave(); }
+    try {
+      const r = await api("/api/files/delete", { method: "POST", body: JSON.stringify({ ids, audio_only: audioOnly }) });
+      ids.forEach((id) => S.selected.delete(id));
+      if (r.skipped.length) toast(`${r.skipped.length} file(s) are busy and were skipped`, true);
+      else toast(audioOnly ? "Audio deleted" : ids.length > 1 ? `${ids.length} files deleted` : "File deleted");
+      if (S.current && r.deleted.includes(S.current.id)) {
+        if (audioOnly) { S.current.has_audio = false; S.current.audio_deleted = true; audio.removeAttribute("src"); audio.load(); }
+        else closeFile();
+      }
+      await loadFiles();
+      if (S.current) { renderHeader(); loadAudio(); }
+    } catch (e) { toast(e.message, true); }
+  }
+  $("selectToggle").onclick = () => { S.selectMode = !S.selectMode; if (!S.selectMode) S.selected.clear(); renderFiles(); };
+  $("bulkAll").onclick = () => { if (S.selected.size === S.files.length) S.selected.clear(); else S.files.forEach((f) => S.selected.add(f.id)); renderFiles(); };
+  $("bulkDelete").onclick = () => deleteFiles([...S.selected]);
+  $("bulkAudio").onclick = () => deleteFiles([...S.selected], true);
 
   // ---- upload
   function uploadFile(file) {
@@ -201,16 +253,18 @@
     const o = transcribeOpts();
     if (o.model) fd.append("model", o.model);
     if (o.language) fd.append("language", o.language);
+    if (o.speakers) fd.append("speakers", o.speakers);
     fd.append("auto", $("autoToggle").checked ? "true" : "false");
     const xhr = new XMLHttpRequest();
     xhr.open("POST", "/api/files");
     xhr.upload.onprogress = (e) => {
       if (!e.lengthComputable) return;
-      S.uploads.get(tid).progress = e.loaded / e.total;
+      const p = e.loaded / e.total;
+      S.uploads.get(tid).progress = p;
       const li = document.querySelector(`[data-tid="${tid}"]`);
       if (li) {
-        li.querySelector(".progress").style.width = (e.loaded / e.total) * 100 + "%";
-        li.querySelector(".pill").textContent = e.loaded < e.total ? `Uploading ${Math.round((e.loaded / e.total) * 100)}%` : "Finishing upload";
+        li.querySelector(".progress").style.width = p * 100 + "%";
+        li.querySelector(".pill").textContent = p < 1 ? `Uploading ${Math.round(p * 100)}%` : "Finishing upload";
       }
     };
     xhr.onload = async () => {
@@ -236,7 +290,6 @@
   ["dragenter", "dragover"].forEach((ev) => dz.addEventListener(ev, (e) => { e.preventDefault(); dz.classList.add("over"); }));
   ["dragleave", "drop"].forEach((ev) => dz.addEventListener(ev, (e) => { e.preventDefault(); dz.classList.remove("over"); }));
   dz.addEventListener("drop", (e) => [...e.dataTransfer.files].forEach(uploadFile));
-  // Allow dropping anywhere on the page too.
   document.addEventListener("dragover", (e) => e.preventDefault());
   document.addEventListener("drop", (e) => {
     if (dz.contains(e.target)) return;
@@ -244,7 +297,6 @@
     [...(e.dataTransfer?.files || [])].forEach(uploadFile);
   });
 
-  // ---- polling
   let pollTimer = null;
   function schedulePoll() {
     clearTimeout(pollTimer);
@@ -259,27 +311,19 @@
     const f = S.files.find((x) => x.id === id);
     if (!f) return;
     S.current = f;
-    S.transcript = null;
-    S.segs = [];
-    S.activeIdx = -1;
-    S.flagCursor = -1;
-    S.peaks = [];
+    S.transcript = null; S.segs = []; S.speakers = {};
+    S.activeIdx = -1; S.activeWord = -1; S.flagCursor = -1; S.peaks = [];
     history.replaceState(null, "", "#" + id);
     $("emptyState").classList.add("hidden");
     $("workspace").classList.remove("hidden");
-    renderFiles();
-    renderHeader();
-    renderSegments();
+    renderFiles(); renderHeader(); renderSegments();
     loadAudio();
     if (f.has_transcript) await loadTranscript();
   }
 
   function closeFile() {
-    S.current = null;
-    S.transcript = null;
-    S.segs = [];
-    audio.removeAttribute("src");
-    audio.load();
+    S.current = null; S.transcript = null; S.segs = []; S.speakers = {};
+    audio.removeAttribute("src"); audio.load();
     history.replaceState(null, "", location.pathname);
     $("workspace").classList.add("hidden");
     $("emptyState").classList.remove("hidden");
@@ -288,11 +332,10 @@
 
   async function loadAudio() {
     const f = S.current;
-    if (!f || f.status === "processing" || (f.status === "error" && !f.duration)) {
-      audio.removeAttribute("src");
-      drawWave();
-      return;
-    }
+    const usable = f && f.has_audio && f.status !== "processing";
+    $("playerCard").classList.toggle("hidden", !!(f && !f.has_audio && f.status !== "processing"));
+    $("audioGone").classList.toggle("hidden", !(f && f.audio_deleted));
+    if (!usable) { audio.removeAttribute("src"); S.peaks = []; drawWave(); return; }
     const src = `/api/files/${f.id}/audio`;
     if (!audio.src.endsWith(src)) {
       audio.src = src;
@@ -306,14 +349,12 @@
     try {
       S.transcript = await api(`/api/files/${S.current.id}/transcript`);
       S.segs = S.transcript.segments;
-    } catch {
-      S.transcript = null; S.segs = [];
-    }
-    renderHeader();
-    renderSegments();
+      S.speakers = S.transcript.speakers || {};
+    } catch { S.transcript = null; S.segs = []; S.speakers = {}; }
+    renderHeader(); renderSegments(); renderSpeakers();
   }
 
-  // ------------------------------------------------------------------ header
+  // ------------------------------------------------------------------ header & progress
   function renderHeader() {
     const f = S.current;
     if (!f) return;
@@ -326,26 +367,53 @@
     if (f.size) add(fmtSize(f.size));
     if (f.source_format) add(f.converted ? `${f.source_format} → MP3` : f.source_format);
     if (f.model && f.status === "done") add("🧠 " + f.model);
-    if (f.language) add("🌐 " + f.language);
-    if (f.transcribe_seconds) add(`took ${fmt(f.transcribe_seconds)}`);
+    if (f.transcribe_seconds) add(`took ${fmt(f.transcribe_seconds)}${f.chunks > 1 ? ` · ${f.chunks} chunks` : ""}`);
+    if (S.transcript?.timing === "estimated") add("word timing estimated");
 
     const busy = isBusy(f);
     const tb = $("transcribeBtn");
     tb.textContent = f.has_transcript ? "Re-transcribe" : "Transcribe";
-    tb.disabled = busy || !f.duration;
+    tb.disabled = busy || !f.has_audio;
     $("downloadBtn").disabled = !S.segs.length;
+    $("diarizeBtn").disabled = busy || !f.has_audio || !S.segs.length || !S.config?.diarization_available;
+    $("deleteAudioBtn").disabled = busy || !f.has_audio;
 
     const proc = $("processing");
-    if (busy || f.status === "error") {
-      proc.classList.remove("hidden");
-      proc.classList.toggle("error", f.status === "error");
-      if (f.status === "processing") { $("procTitle").textContent = "Preparing audio…"; $("procDetail").textContent = "Checking the format and converting to MP3 if needed"; }
-      else if (f.status === "queued") { $("procTitle").textContent = "Queued"; $("procDetail").textContent = "Waiting for the transcription worker"; }
-      else if (f.status === "transcribing") {
-        $("procTitle").textContent = `Transcribing with ${f.model || "model"}…`;
-        $("procDetail").textContent = `${fmt(f.elapsed || 0)} elapsed · llama-swap may need to load the model first`;
-      } else { $("procTitle").textContent = "Something went wrong"; $("procDetail").textContent = f.error || "Unknown error"; }
-    } else proc.classList.add("hidden");
+    const bars = $("procBars");
+    bars.innerHTML = "";
+    if (!busy && !f.error) { proc.classList.add("hidden"); return; }
+    proc.classList.remove("hidden");
+    proc.classList.toggle("error", !busy);
+    const p = f.progress || {};
+    if (!busy) {
+      $("procTitle").textContent = "Something went wrong";
+      $("procDetail").textContent = f.error || "Unknown error";
+      return;
+    }
+    if (f.status === "processing") { $("procTitle").textContent = "Preparing audio…"; $("procDetail").textContent = "Checking the format and converting to MP3 if needed"; return; }
+    if (f.status === "queued") { $("procTitle").textContent = "Queued"; $("procDetail").textContent = "Waiting for the current job to finish"; return; }
+    if (f.status === "diarizing") {
+      $("procTitle").textContent = "Detecting speakers…";
+      $("procDetail").textContent = `${fmt(f.elapsed || 0)} elapsed · runs on the server CPU`;
+    } else {
+      $("procTitle").textContent = `Transcribing with ${f.model || "model"}…`;
+      let detail = `${fmt(f.elapsed || 0)} elapsed`;
+      if (p.label) detail += ` · ${p.label}`;
+      else if (p.stage === "speakers") detail += " · matching speakers to text";
+      else if (p.eta != null && p.done < p.total) detail += ` · about ${fmt(p.eta)} left`;
+      else if (!p.done) detail += " · llama-swap may need to load the model first";
+      $("procDetail").textContent = detail;
+      if (p.total) addBar(bars, "Transcription", p.done / p.total, `${p.done}/${p.total}`);
+    }
+    if (p.speakers != null) addBar(bars, "Speakers", p.speakers, Math.round(p.speakers * 100) + "%");
+  }
+  function addBar(box, label, frac, text) {
+    const row = el("div", "bar-row");
+    const track = el("div", "bar-track");
+    const fill = el("div", "bar-fill"); fill.style.width = Math.max(2, Math.min(100, frac * 100)) + "%";
+    track.append(fill);
+    row.append(el("span", null, label), track, el("span", null, text));
+    box.append(row);
   }
 
   $("fileTitle").addEventListener("keydown", (e) => { if (e.key === "Enter") { e.preventDefault(); e.target.blur(); } if (e.key === "Escape") { e.target.textContent = S.current.name; e.target.blur(); } });
@@ -364,19 +432,18 @@
       await flushSave();
       S.current = await api(`/api/files/${f.id}/transcribe`, { method: "POST", body: JSON.stringify(transcribeOpts()) });
       S.current.has_transcript = false;
-      S.transcript = null; S.segs = [];
-      renderHeader(); renderSegments();
+      S.transcript = null; S.segs = []; S.speakers = {};
+      renderHeader(); renderSegments(); renderSpeakers();
       await loadFiles(); schedulePoll();
     } catch (e) { toast(e.message, true); }
   };
 
-  // menus
-  function bindMenu(btn, menu) {
+  function bindMenu(btn) {
     $(btn).onclick = (e) => { e.stopPropagation(); const m = $(btn).parentElement; const open = m.classList.contains("open"); closeMenus(); if (!open) m.classList.add("open"); };
   }
-  function closeMenus() { document.querySelectorAll(".menu.open").forEach((m) => m.classList.remove("open")); }
+  function closeMenus() { document.querySelectorAll(".menu.open").forEach((m) => m.classList.remove("open")); hideSpkMenu(); }
   bindMenu("downloadBtn"); bindMenu("moreBtn");
-  document.addEventListener("click", closeMenus);
+  document.addEventListener("click", (e) => { if (!e.target.closest("#spkMenu")) closeMenus(); });
 
   $("downloadMenu").addEventListener("click", async (e) => {
     const b = e.target.closest("button[data-fmt]");
@@ -389,22 +456,125 @@
   });
   $("revertBtn").onclick = async () => {
     if (!S.current || !S.transcript) return;
-    if (!confirm("Discard all edits and restore the original transcription?")) return;
+    if (!confirm("Discard all edits (text and speaker names) and restore the original transcription?")) return;
     try {
       clearTimeout(S.saveTimer); S.pendingSave = false;
       S.transcript = await api(`/api/files/${S.current.id}/transcript/revert`, { method: "POST" });
-      S.segs = S.transcript.segments;
-      renderSegments(); toast("Transcript restored");
+      S.segs = S.transcript.segments; S.speakers = S.transcript.speakers || {};
+      renderSegments(); renderSpeakers(); toast("Transcript restored");
     } catch (e) { toast(e.message, true); }
   };
-  $("deleteBtn").onclick = async () => {
-    if (!S.current || !confirm(`Delete "${S.current.name}"? This removes the audio and transcript.`)) return;
+  $("diarizeBtn").onclick = async () => {
+    if (!S.current) return;
+    let n = $("speakersSelect").value;
+    if (n === "off") n = "auto";
+    if (!confirm(`Detect speakers again (${n === "auto" ? "automatic count" : n + " speakers"})? Speaker labels will be replaced; your text edits are kept.`)) return;
     try {
-      clearTimeout(S.saveTimer); S.pendingSave = false;
-      await api(`/api/files/${S.current.id}`, { method: "DELETE" });
-      closeFile(); loadFiles(); toast("File deleted");
+      await flushSave();
+      S.current = await api(`/api/files/${S.current.id}/diarize`, { method: "POST", body: JSON.stringify({ speakers: n }) });
+      renderHeader(); await loadFiles(); schedulePoll();
     } catch (e) { toast(e.message, true); }
   };
+  $("deleteAudioBtn").onclick = () => S.current && deleteFiles([S.current.id], true);
+  $("deleteBtn").onclick = () => S.current && deleteFiles([S.current.id]);
+
+  // ------------------------------------------------------------------ speakers
+  function spkColor(id) {
+    const keys = Object.keys(S.speakers);
+    const i = keys.indexOf(id);
+    return SPK_COLORS[(i < 0 ? 0 : i) % SPK_COLORS.length];
+  }
+  const spkName = (id) => (id && S.speakers[id]?.name) || id || "";
+
+  function renderSpeakers() {
+    const card = $("speakersCard");
+    const ids = Object.keys(S.speakers);
+    card.classList.toggle("hidden", !ids.length || !S.segs.length);
+    const list = $("speakerList");
+    list.innerHTML = "";
+    const talk = {};
+    let total = 0;
+    for (const s of S.segs) if (s.speaker) { talk[s.speaker] = (talk[s.speaker] || 0) + (s.end - s.start); total += s.end - s.start; }
+    for (const id of ids) {
+      const li = el("li");
+      const sw = el("span", "sw"); sw.style.background = spkColor(id);
+      const box = el("div"); box.style.minWidth = "0";
+      const input = el("input"); input.value = spkName(id); input.spellcheck = false;
+      input.oninput = () => {
+        S.speakers[id].name = input.value || id;
+        document.querySelectorAll(`.spk-chip[data-spk="${id}"]`).forEach((c) => (c.textContent = S.speakers[id].name));
+        queueSave();
+      };
+      input.onkeydown = (e) => { if (e.key === "Enter") input.blur(); };
+      const share = el("span", "share");
+      share.style.background = spkColor(id);
+      share.style.width = total ? Math.max(2, ((talk[id] || 0) / total) * 100) + "%" : "0";
+      box.append(input, share);
+      li.append(sw, box, el("small", null, `${fmt(talk[id] || 0)} · ${total ? Math.round(((talk[id] || 0) / total) * 100) : 0}%`));
+      list.append(li);
+    }
+  }
+  function newSpeakerId() {
+    let n = Object.keys(S.speakers).length + 1;
+    while (S.speakers["S" + n]) n++;
+    return "S" + n;
+  }
+  $("addSpeaker").onclick = () => {
+    const id = newSpeakerId();
+    S.speakers[id] = { name: `Speaker ${id.slice(1)}` };
+    renderSpeakers(); queueSave();
+    const inputs = $("speakerList").querySelectorAll("input");
+    inputs[inputs.length - 1]?.select();
+  };
+
+  function turnRange(i) {
+    const spk = S.segs[i].speaker;
+    let a = i, b = i;
+    while (a > 0 && S.segs[a - 1].speaker === spk) a--;
+    while (b < S.segs.length - 1 && S.segs[b + 1].speaker === spk) b++;
+    return [a, b];
+  }
+  function showSpkMenu(i, anchor, isTurnStart) {
+    S.spkTarget = i;
+    S.spkScope = isTurnStart ? "turn" : "seg";
+    const m = $("spkMenu");
+    m.querySelectorAll(".spk-scope button").forEach((b) => b.classList.toggle("on", b.dataset.scope === S.spkScope));
+    const list = $("spkMenuList");
+    list.innerHTML = "";
+    for (const id of Object.keys(S.speakers)) {
+      const b = el("button", "opt" + (S.segs[i].speaker === id ? " cur" : ""));
+      const dot = el("i"); dot.style.background = spkColor(id);
+      b.append(dot, document.createTextNode(spkName(id)));
+      b.onclick = () => assignSpeaker(id);
+      list.append(b);
+    }
+    m.classList.remove("hidden");
+    const r = anchor.getBoundingClientRect();
+    const mh = m.offsetHeight, mw = m.offsetWidth;
+    m.style.left = Math.min(r.left, innerWidth - mw - 8) + "px";
+    m.style.top = (r.bottom + mh + 8 > innerHeight ? r.top - mh - 6 : r.bottom + 6) + "px";
+  }
+  function hideSpkMenu() { $("spkMenu").classList.add("hidden"); S.spkTarget = null; }
+  $("spkMenu").querySelectorAll(".spk-scope button").forEach((b) => (b.onclick = (e) => {
+    e.stopPropagation();
+    S.spkScope = b.dataset.scope;
+    $("spkMenu").querySelectorAll(".spk-scope button").forEach((x) => x.classList.toggle("on", x === b));
+  }));
+  $("spkNew").onclick = () => {
+    const id = newSpeakerId();
+    const name = prompt("Name for the new speaker:", `Speaker ${id.slice(1)}`);
+    if (name == null) return;
+    S.speakers[id] = { name: name.trim() || id };
+    assignSpeaker(id);
+  };
+  function assignSpeaker(id) {
+    const i = S.spkTarget;
+    if (i == null) return;
+    const [a, b] = S.spkScope === "turn" ? turnRange(i) : [i, i];
+    for (let k = a; k <= b; k++) S.segs[k].speaker = id;
+    hideSpkMenu();
+    renderSegments(); renderSpeakers(); queueSave();
+  }
 
   // ------------------------------------------------------------------ flags
   function isFlagged(s) {
@@ -412,10 +582,25 @@
     if (s.issues && s.issues.length) return true;
     return s.confidence != null && s.confidence < S.threshold;
   }
-
+  const norm = (t) => t.replace(/\s+/g, " ").trim();
   function wordsMatch(s) {
-    if (!s.words || !s.words.length) return false;
-    return s.words.map((w) => w.w).join("").trim() === s.text.trim();
+    return !!(s.words && s.words.length) && norm(s.words.map((w) => w.w).join("")) === norm(s.text);
+  }
+  /** Words for display/highlighting: model words when they still match the text, else an even estimate. */
+  function displayWords(s) {
+    if (wordsMatch(s)) return s.words;
+    if (s._ew && s._ewText === s.text) return s._ew;
+    const toks = s.text.trim().split(/\s+/).filter(Boolean);
+    const weights = toks.map((t) => t.length + 2);
+    const total = weights.reduce((a, b) => a + b, 0) || 1;
+    let cum = 0;
+    const span = Math.max(0.1, s.end - s.start);
+    s._ew = toks.map((t, i) => {
+      const st = s.start + (cum / total) * span; cum += weights[i];
+      return { w: " " + t, s: st, e: s.start + (cum / total) * span, p: null, est: true };
+    });
+    s._ewText = s.text;
+    return s._ew;
   }
 
   // ------------------------------------------------------------------ segments
@@ -429,16 +614,7 @@
   function fillText(node, s) {
     node.textContent = "";
     const q = S.search.toLowerCase();
-    if (wordsMatch(s) && !q) {
-      const lead = s.words[0].w.length - s.words[0].w.trimStart().length;
-      s.words.forEach((w, i) => {
-        const txt = i === 0 ? w.w.slice(lead) : w.w;
-        const sp = el("span", "w" + (w.p != null && w.p < S.wordThreshold ? " low" : ""), txt);
-        sp.dataset.i = i;
-        if (w.p != null) sp.title = `${Math.round(w.p * 100)}% confident`;
-        node.append(sp);
-      });
-    } else if (q && s.text.toLowerCase().includes(q)) {
+    if (q && s.text.toLowerCase().includes(q)) {
       const lower = s.text.toLowerCase(); let pos = 0, idx;
       while ((idx = lower.indexOf(q, pos)) !== -1) {
         node.append(document.createTextNode(s.text.slice(pos, idx)));
@@ -446,7 +622,18 @@
         pos = idx + q.length;
       }
       node.append(document.createTextNode(s.text.slice(pos)));
-    } else node.textContent = s.text;
+      return;
+    }
+    const words = displayWords(s);
+    if (!words.length) { node.textContent = s.text; return; }
+    words.forEach((w, i) => {
+      const txt = i === 0 ? w.w.trimStart() : w.w;
+      const low = w.p != null && w.p < S.wordThreshold;
+      const sp = el("span", "w" + (low ? " low" : ""), txt);
+      sp.dataset.i = i;
+      if (w.p != null) sp.title = `${Math.round(w.p * 100)}% confident`;
+      node.append(sp);
+    });
   }
 
   const CHECK = '<svg viewBox="0 0 24 24"><path d="M5 12l5 5L20 7"/></svg>';
@@ -454,23 +641,37 @@
 
   function renderSegments() {
     const box = $("segments");
+    const scroll = box.scrollTop;
     box.innerHTML = "";
-    S.lastWordEl = null;
+    S.activeIdx = -1; S.activeWord = -1;
     if (!S.segs.length) {
       const f = S.current;
       const msg = !f ? "" : isBusy(f) ? "The transcript will appear here when it's ready." :
         f.status === "error" ? "Transcription failed. Check the model and try again." :
         "No transcript yet. Pick a model above and click Transcribe.";
       box.append(el("div", "seg-empty", msg));
-      renderFlags(); return;
+      renderFlags(); renderSpeakers(); return;
     }
     const frag = document.createDocumentFragment();
+    const hasSpk = Object.keys(S.speakers).length > 0;
     S.segs.forEach((s, i) => {
-      const row = el("div", "seg");
+      const turnStart = hasSpk && (i === 0 || S.segs[i - 1].speaker !== s.speaker);
+      const row = el("div", "seg" + (turnStart ? " turn" : ""));
       row.dataset.i = i;
+      if (s.speaker) { row.dataset.spk = s.speaker; row.style.setProperty("--spk", spkColor(s.speaker)); }
+      const left = el("div", "seg-left");
+      if (hasSpk) {
+        const chip = el("button", "spk-chip" + (turnStart ? "" : " minor"), s.speaker ? spkName(s.speaker) : "Unassigned");
+        if (s.speaker) chip.dataset.spk = s.speaker;
+        chip.title = "Change speaker";
+        chip.onclick = (e) => { e.stopPropagation(); showSpkMenu(i, chip, turnStart); };
+        left.append(chip);
+      }
       const t = el("button", "seg-time", fmt(s.start));
       t.title = `${fmt(s.start, true)} → ${fmt(s.end, true)} · click to play`;
       t.onclick = () => seekTo(s.start, true);
+      left.append(t);
+      if (s.edited) left.append(el("span", "seg-edited", "edited"));
       const txt = el("div", "seg-text");
       txt.contentEditable = "true";
       txt.spellcheck = true;
@@ -485,12 +686,12 @@
       const rv = el("button", "seg-review");
       rv.onclick = () => toggleReviewed(i);
       side.append(rv, conf);
-      row.append(t, txt, side);
-      if (s.edited) row.append(el("span", "seg-edited", "edited"));
+      row.append(left, txt, side);
       frag.append(row);
       decorateRow(row, s);
     });
     box.append(frag);
+    box.scrollTop = scroll;
     renderFlags();
     updateActive(true);
   }
@@ -518,18 +719,17 @@
     queueSave();
   }
 
-  // editing
+  // ---- editing
   const segBox = $("segments");
   segBox.addEventListener("input", (e) => {
     const txt = e.target.closest(".seg-text");
     if (!txt) return;
     const row = txt.parentElement;
-    const i = +row.dataset.i;
-    const s = S.segs[i];
+    const s = S.segs[+row.dataset.i];
     s.text = txt.textContent.replace(/\n/g, " ");
     if (!s.edited) {
       s.edited = true;
-      row.append(el("span", "seg-edited", "edited"));
+      row.querySelector(".seg-left").append(el("span", "seg-edited", "edited"));
     }
     if (!s.reviewed) { s.reviewed = true; decorateRow(row, s); renderFlags(); }
     queueSave();
@@ -537,20 +737,27 @@
   });
   segBox.addEventListener("focusout", (e) => {
     const txt = e.target.closest(".seg-text");
-    if (!txt) return;
+    if (!txt || !txt.isConnected) return;
     const s = S.segs[+txt.parentElement.dataset.i];
+    if (!s) return;
     if (s.edited && s.words && s.words.length && !wordsMatch(s)) s.words = [];
     fillText(txt, s);
+    if (+txt.parentElement.dataset.i === S.activeIdx) { S.activeWord = -2; updateActive(); }
   });
   segBox.addEventListener("keydown", (e) => {
     const txt = e.target.closest(".seg-text");
     if (!txt) return;
+    const i = +txt.parentElement.dataset.i;
     if (e.key === "Enter") {
       e.preventDefault();
-      const next = rowEl(+txt.parentElement.dataset.i + 1);
-      if (next) focusEnd(next.querySelector(".seg-text"));
-      else txt.blur();
+      const next = rowEl(i + 1);
+      if (next) placeCaret(next.querySelector(".seg-text"), Infinity); else txt.blur();
     } else if (e.key === "Escape") txt.blur();
+    else if (e.key === "Backspace" && i > 0 && caretOffset(txt) === 0 && !getSelection().toString()) {
+      e.preventDefault(); mergeWithPrevious(i);
+    } else if (e.altKey && e.code === "KeyS") {
+      e.preventDefault(); e.stopPropagation(); splitAt(i, caretOffset(txt));
+    }
   });
   segBox.addEventListener("paste", (e) => {
     if (!e.target.closest(".seg-text")) return;
@@ -563,15 +770,71 @@
     if (w && e.altKey) {
       e.preventDefault();
       const s = S.segs[+w.closest(".seg").dataset.i];
-      const word = s.words[+w.dataset.i];
+      const word = displayWords(s)[+w.dataset.i];
       seekTo(word?.s ?? s.start, true);
     }
   });
-  function focusEnd(node) {
+
+  function caretOffset(node) {
+    const sel = getSelection();
+    if (!sel.rangeCount || !node.contains(sel.anchorNode)) return -1;
+    const r = sel.getRangeAt(0).cloneRange();
+    r.selectNodeContents(node);
+    r.setEnd(sel.getRangeAt(0).startContainer, sel.getRangeAt(0).startOffset);
+    return r.toString().length;
+  }
+  function placeCaret(node, offset) {
     node.focus();
+    const sel = getSelection();
     const r = document.createRange();
-    r.selectNodeContents(node); r.collapse(false);
-    const sel = getSelection(); sel.removeAllRanges(); sel.addRange(r);
+    let remaining = offset, placed = false;
+    const walker = document.createTreeWalker(node, NodeFilter.SHOW_TEXT);
+    let t;
+    while ((t = walker.nextNode())) {
+      if (remaining <= t.length) { r.setStart(t, remaining); placed = true; break; }
+      remaining -= t.length;
+    }
+    if (!placed) { r.selectNodeContents(node); r.collapse(false); }
+    sel.removeAllRanges(); sel.addRange(r);
+  }
+
+  function nextId() { return S.segs.reduce((m, s) => Math.max(m, s.id), -1) + 1; }
+  function splitAt(i, offset) {
+    const s = S.segs[i];
+    const text = s.text;
+    if (offset <= 0 || offset >= text.length) { toast("Place the cursor inside the text to split"); return; }
+    const a = text.slice(0, offset).trimEnd(), b = text.slice(offset).trimStart();
+    if (!a || !b) return;
+    // split time at the matching word boundary if timings exist, else proportionally
+    const words = displayWords(s);
+    let acc = 0, cut = s.start + (s.end - s.start) * (offset / text.length), wi = words.length;
+    for (let k = 0; k < words.length; k++) {
+      acc += (k === 0 ? words[k].w.trimStart() : words[k].w).length;
+      if (acc >= offset) { wi = k + 1; cut = words[k + 1]?.s ?? cut; break; }
+    }
+    const matched = wordsMatch(s);
+    const first = { ...s, text: a, end: cut, edited: true, words: matched ? s.words.slice(0, wi) : [] };
+    const second = { ...s, id: nextId(), text: b, start: cut, edited: true, words: matched ? s.words.slice(wi) : [] };
+    delete first._ew; delete second._ew;
+    S.segs.splice(i, 1, first, second);
+    renderSegments(); queueSave();
+    placeCaret(rowEl(i + 1).querySelector(".seg-text"), 0);
+  }
+  function mergeWithPrevious(i) {
+    const prev = S.segs[i - 1], cur = S.segs[i];
+    const joinAt = prev.text.length + 1;
+    const merged = {
+      ...prev, text: (prev.text + " " + cur.text).trim(), end: Math.max(prev.end, cur.end), edited: true,
+      words: wordsMatch(prev) && wordsMatch(cur) ? prev.words.concat(cur.words) : [],
+      reviewed: prev.reviewed && cur.reviewed,
+      issues: [...new Set([...(prev.issues || []), ...(cur.issues || [])])],
+      low_words: [...(prev.low_words || []), ...(cur.low_words || [])],
+      confidence: prev.confidence == null ? cur.confidence : cur.confidence == null ? prev.confidence : Math.min(prev.confidence, cur.confidence),
+    };
+    delete merged._ew;
+    S.segs.splice(i - 1, 2, merged);
+    renderSegments(); queueSave();
+    placeCaret(rowEl(i - 1).querySelector(".seg-text"), joinAt);
   }
 
   function pauseForTyping() {
@@ -587,10 +850,10 @@
     }
   }
 
-  // search
   $("searchInput").addEventListener("input", (e) => {
     S.search = e.target.value.trim();
     S.segs.forEach((s, i) => { const r = rowEl(i); if (r) { fillText(r.querySelector(".seg-text"), s); decorateRow(r, s); } });
+    S.activeWord = -2;
     const first = S.segs.findIndex((s) => S.search && s.text.toLowerCase().includes(S.search.toLowerCase()));
     if (first >= 0) rowEl(first).scrollIntoView({ block: "center" });
   });
@@ -602,6 +865,16 @@
     clearTimeout(S.saveTimer);
     S.saveTimer = setTimeout(save, 900);
   }
+  function serialize() {
+    return {
+      segments: S.segs.map((s) => ({
+        id: s.id, start: s.start, end: s.end, text: s.text, speaker: s.speaker ?? null,
+        reviewed: !!s.reviewed, edited: !!s.edited, words: s.words || [],
+        confidence: s.confidence ?? null, issues: s.issues || [], low_words: s.low_words || [],
+      })),
+      speakers: S.speakers,
+    };
+  }
   async function save() {
     if (!S.current || !S.pendingSave) return;
     if (S.saving) { S.saveTimer = setTimeout(save, 300); return; }
@@ -609,10 +882,7 @@
     $("saveState").textContent = "Saving…";
     const id = S.current.id;
     try {
-      await api(`/api/files/${id}/transcript`, {
-        method: "PUT",
-        body: JSON.stringify({ segments: S.segs.map((s) => ({ id: s.id, start: s.start, end: s.end, text: s.text, reviewed: !!s.reviewed, edited: !!s.edited, words: s.words })) }),
-      });
+      await api(`/api/files/${id}/transcript`, { method: "PUT", body: JSON.stringify(serialize()) });
       if (S.current && S.current.id === id) $("saveState").textContent = "All changes saved";
     } catch (e) {
       S.pendingSave = true;
@@ -650,7 +920,8 @@
       const li = el("li", "flag-item" + (S.flagged[S.flagCursor] === i ? " current" : ""));
       li.dataset.i = i;
       const top = el("div", "flag-top");
-      top.append(el("span", null, `${fmt(s.start)} – ${fmt(s.end)}`), el("span", "flag-conf", s.confidence == null ? "?" : Math.round(s.confidence * 100) + "%"));
+      top.append(el("span", null, `${fmt(s.start)} – ${fmt(s.end)}${s.speaker ? " · " + spkName(s.speaker) : ""}`),
+        el("span", "flag-conf", s.confidence == null ? "?" : Math.round(s.confidence * 100) + "%"));
       li.append(top, el("div", "flag-text", s.text || "(empty)"));
       const reasons = el("div", "flag-reasons");
       if (s.confidence != null && s.confidence < S.threshold) reasons.append(el("span", null, "Low confidence"));
@@ -666,8 +937,7 @@
     if (!S.flagged.length) return;
     S.flagCursor = (k + S.flagged.length) % S.flagged.length;
     const i = S.flagged[S.flagCursor];
-    const s = S.segs[i];
-    seekTo(Math.max(0, s.start - 0.6), true);
+    seekTo(Math.max(0, S.segs[i].start - 0.6), true);
     const row = rowEl(i);
     if (row) {
       row.scrollIntoView({ block: "center", behavior: "smooth" });
@@ -701,19 +971,18 @@
 
   // ------------------------------------------------------------------ player
   function seekTo(t, play = false) {
-    if (!audio.src) return;
+    if (!audio.getAttribute("src")) return;
     audio.currentTime = Math.max(0, Math.min(t, audio.duration || t));
     if (play) audio.play().catch(() => {});
     updateActive(true);
     drawWave();
   }
-  const playBtn = $("playBtn");
   function togglePlay() {
-    if (!audio.src) return;
+    if (!audio.getAttribute("src")) return;
     S.resumeAfterTyping = false; clearTimeout(S.typingTimer);
     if (audio.paused) audio.play().catch((e) => toast(e.message, true)); else audio.pause();
   }
-  playBtn.onclick = togglePlay;
+  $("playBtn").onclick = togglePlay;
   $("backBtn").onclick = () => seekTo(audio.currentTime - 5);
   $("fwdBtn").onclick = () => seekTo(audio.currentTime + 5);
   $("rateSelect").onchange = (e) => { audio.playbackRate = parseFloat(e.target.value); store.set("rate", e.target.value); };
@@ -744,14 +1013,25 @@
     return ans;
   }
 
+  function setWordClasses(row, wi) {
+    if (!row) return;
+    row.querySelectorAll(".seg-text .w").forEach((n) => {
+      const k = +n.dataset.i;
+      n.classList.toggle("past", k < wi);
+      n.classList.toggle("now", k === wi);
+    });
+  }
+
   let lastScroll = 0;
   function updateActive(force = false) {
     const t = audio.currentTime || 0;
     $("curTime").textContent = fmt(t);
     const i = findSeg(t);
     if (i !== S.activeIdx || force) {
-      rowEl(S.activeIdx)?.classList.remove("active");
+      const old = rowEl(S.activeIdx);
+      if (old) { old.classList.remove("active"); setWordClasses(old, -1); }
       S.activeIdx = i;
+      S.activeWord = -2;
       const row = rowEl(i);
       if (row) {
         row.classList.add("active");
@@ -764,19 +1044,17 @@
         }
       }
     }
-    // word highlight
+    // karaoke-style word highlight
     const s = S.segs[i];
-    let wEl = null;
-    if (s && s.words && s.words.length && t <= s.end + 0.3) {
-      const row = rowEl(i);
-      let wi = -1;
-      for (let k = 0; k < s.words.length; k++) { if (s.words[k].s != null && s.words[k].s <= t) wi = k; else if (s.words[k].s > t) break; }
-      if (wi >= 0 && row) wEl = row.querySelector(`.w[data-i="${wi}"]`);
+    let wi = -1;
+    if (s && !S.search) {
+      const words = displayWords(s);
+      if (t > s.end + 0.4) wi = words.length; // between segments: all spoken
+      else for (let k = 0; k < words.length; k++) { if (words[k].s != null && words[k].s <= t) wi = k; else if (words[k].s > t) break; }
     }
-    if (wEl !== S.lastWordEl) {
-      S.lastWordEl?.classList.remove("now");
-      wEl?.classList.add("now");
-      S.lastWordEl = wEl;
+    if (wi !== S.activeWord) {
+      S.activeWord = wi;
+      setWordClasses(rowEl(i), wi);
     }
   }
 
@@ -795,23 +1073,31 @@
     if (!dur) return;
     const x = (t) => (t / dur) * w;
 
-    // flagged regions
+    // speaker lanes along the top
+    if (Object.keys(S.speakers).length) {
+      for (const s of S.segs) {
+        if (!s.speaker) continue;
+        ctx.fillStyle = spkColor(s.speaker);
+        ctx.globalAlpha = 0.85;
+        ctx.fillRect(x(s.start), 0, Math.max(1, x(s.end) - x(s.start)), 3);
+      }
+      ctx.globalAlpha = 1;
+    }
     ctx.fillStyle = waveColors.warn;
     for (const i of S.flagged) {
       const s = S.segs[i];
       ctx.globalAlpha = 0.16;
-      ctx.fillRect(x(s.start), 0, Math.max(2, x(s.end) - x(s.start)), h);
+      ctx.fillRect(x(s.start), 4, Math.max(2, x(s.end) - x(s.start)), h - 4);
       ctx.globalAlpha = 0.9;
       ctx.fillRect(x(s.start), h - 3, Math.max(2, x(s.end) - x(s.start)), 3);
     }
     ctx.globalAlpha = 1;
-    // active segment
     const act = S.segs[S.activeIdx];
-    if (act) { ctx.fillStyle = waveColors.a; ctx.globalAlpha = 0.1; ctx.fillRect(x(act.start), 0, x(act.end) - x(act.start), h); ctx.globalAlpha = 1; }
+    if (act) { ctx.fillStyle = waveColors.a; ctx.globalAlpha = 0.1; ctx.fillRect(x(act.start), 4, x(act.end) - x(act.start), h - 4); ctx.globalAlpha = 1; }
 
     const progress = x(audio.currentTime || 0);
     const bar = 2, gap = 1, n = Math.floor(w / (bar + gap));
-    const mid = h / 2 - 2;
+    const mid = h / 2;
     const grad = ctx.createLinearGradient(0, 0, w, 0);
     grad.addColorStop(0, waveColors.a); grad.addColorStop(1, waveColors.b);
     const peaks = S.peaks;
@@ -821,12 +1107,11 @@
         const a = Math.floor((k / n) * peaks.length), b = Math.max(a + 1, Math.floor(((k + 1) / n) * peaks.length));
         for (let j = a; j < b && j < peaks.length; j++) p = Math.max(p, peaks[j]);
       }
-      const bh = Math.max(1.5, p * (mid - 2));
+      const bh = Math.max(1.5, p * (mid - 8));
       const bx = k * (bar + gap);
       ctx.fillStyle = bx < progress ? grad : waveColors.wave;
       ctx.fillRect(bx, mid - bh, bar, bh * 2);
     }
-    // playhead
     ctx.fillStyle = waveColors.b;
     ctx.fillRect(progress - 1, 0, 2, h);
   }
@@ -839,9 +1124,12 @@
   waveWrap.addEventListener("mousemove", (e) => {
     const dur = audio.duration || 0; if (!dur) return;
     const r = waveWrap.getBoundingClientRect();
+    const t = ((e.clientX - r.left) / r.width) * dur;
     const hov = $("waveHover");
     hov.style.left = e.clientX - r.left + "px";
-    hov.textContent = fmt(((e.clientX - r.left) / r.width) * dur);
+    const i = findSeg(t);
+    const spk = S.segs[i]?.speaker && t <= S.segs[i].end + 0.5 ? " · " + spkName(S.segs[i].speaker) : "";
+    hov.textContent = fmt(t) + spk;
   });
   new ResizeObserver(() => drawWave()).observe(waveWrap);
   matchMedia("(prefers-color-scheme: light)").addEventListener("change", () => { waveColors = null; drawWave(); });
@@ -849,6 +1137,7 @@
   // ------------------------------------------------------------------ keyboard
   document.addEventListener("keydown", (e) => {
     const inField = e.target.closest("input, select, [contenteditable=true]");
+    if (e.key === "Escape") hideSpkMenu();
     if ((e.ctrlKey || e.metaKey) && e.code === "Space") { e.preventDefault(); togglePlay(); return; }
     if (e.code === "Space" && !inField) { e.preventDefault(); togglePlay(); return; }
     if (e.altKey && !e.ctrlKey && !e.metaKey) {

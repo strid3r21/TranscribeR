@@ -6,54 +6,32 @@ import array
 import asyncio
 import json
 import logging
-import math
 import os
 import re
 import shutil
 import time
 import uuid
+from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any, Optional
-
-import httpx
-from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, File, Form, HTTPException, Query, UploadFile
 from fastapi.responses import FileResponse, JSONResponse, Response
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
-# --------------------------------------------------------------------------- #
-# Configuration (environment variables)
-# --------------------------------------------------------------------------- #
-
-
-def _env_bool(name: str, default: bool) -> bool:
-    return os.getenv(name, str(default)).strip().lower() in {"1", "true", "yes", "on"}
-
-
-DATA_DIR = Path(os.getenv("DATA_DIR", "/data"))
-FILES_DIR = DATA_DIR / "files"
-LLAMA_SWAP_URL = os.getenv("LLAMA_SWAP_URL", "http://localhost:8080").rstrip("/")
-LLAMA_SWAP_API_KEY = os.getenv("LLAMA_SWAP_API_KEY", "")
-DEFAULT_MODEL = os.getenv("DEFAULT_MODEL", "whisper")
-DEFAULT_LANGUAGE = os.getenv("DEFAULT_LANGUAGE", "")  # empty = auto detect
-UPSTREAM_FORMAT = os.getenv("UPSTREAM_FORMAT", "mp3").lower()  # mp3 | wav
-REQUEST_TIMEOUT = float(os.getenv("REQUEST_TIMEOUT", "3600"))
-UNCERTAINTY_THRESHOLD = float(os.getenv("UNCERTAINTY_THRESHOLD", "0.70"))
-WORD_THRESHOLD = float(os.getenv("WORD_THRESHOLD", "0.45"))
-MP3_BITRATE = os.getenv("MP3_BITRATE", "128k")
-AUTO_TRANSCRIBE = _env_bool("AUTO_TRANSCRIBE", True)
-MAX_UPLOAD_MB = int(os.getenv("MAX_UPLOAD_MB", "4096"))
-
-PEAK_BINS = 2000
-ACTIVE_STATES = {"processing", "queued", "transcribing"}
+import asr
+import diarize
+import settings as cfg
 
 logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO").upper(),
                     format="%(asctime)s %(levelname)s %(name)s: %(message)s")
 log = logging.getLogger("transcriber")
 
+PEAK_BINS = 2000
+ACTIVE_STATES = {"processing", "queued", "transcribing", "diarizing"}
 queue: asyncio.Queue[tuple[str, dict]] = asyncio.Queue()
+PROGRESS: dict[str, dict] = {}  # live, in-memory job progress per file
 
 # --------------------------------------------------------------------------- #
 # Storage helpers
@@ -65,7 +43,7 @@ ID_RE = re.compile(r"^[a-f0-9]{32}$")
 def fdir(fid: str) -> Path:
     if not ID_RE.match(fid):
         raise HTTPException(404, "File not found")
-    return FILES_DIR / fid
+    return cfg.FILES_DIR / fid
 
 
 def write_json(path: Path, data: Any) -> None:
@@ -99,26 +77,21 @@ def public_meta(meta: dict) -> dict:
     d = fdir(meta["id"])
     out = dict(meta)
     out["has_transcript"] = (d / "transcript.json").exists()
-    if meta.get("status") == "transcribing" and meta.get("started_at"):
+    out["has_audio"] = (d / "audio.mp3").exists()
+    if meta.get("status") in ("transcribing", "diarizing") and meta.get("started_at"):
         out["elapsed"] = round(time.time() - meta["started_at"], 1)
+        out["progress"] = PROGRESS.get(meta["id"])
     return out
 
 
 # --------------------------------------------------------------------------- #
-# ffmpeg helpers
+# Upload preparation
 # --------------------------------------------------------------------------- #
 
 
-async def run(*cmd: str) -> tuple[int, bytes, bytes]:
-    proc = await asyncio.create_subprocess_exec(
-        *cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
-    out, err = await proc.communicate()
-    return proc.returncode or 0, out, err
-
-
 async def probe(path: Path) -> dict:
-    code, out, err = await run("ffprobe", "-v", "error", "-print_format", "json",
-                               "-show_format", "-show_streams", str(path))
+    code, out, err = await asr.run("ffprobe", "-v", "error", "-print_format", "json",
+                                   "-show_format", "-show_streams", str(path))
     if code != 0:
         raise RuntimeError(f"Not a readable media file: {err.decode(errors='ignore')[-300:]}")
     return json.loads(out or b"{}")
@@ -133,10 +106,9 @@ def is_mp3(info: dict) -> bool:
 
 
 async def compute_peaks(audio: Path, duration: float) -> list[float]:
-    # Keep the decoded sample count bounded so very long files stay cheap.
     rate = int(max(200, min(4000, 8_000_000 / max(duration, 1))))
-    code, out, err = await run("ffmpeg", "-v", "error", "-i", str(audio), "-ac", "1",
-                               "-ar", str(rate), "-f", "s16le", "-")
+    code, out, _ = await asr.run("ffmpeg", "-v", "error", "-i", str(audio), "-ac", "1",
+                                 "-ar", str(rate), "-f", "s16le", "-")
     if code != 0 or not out:
         return []
     samples = array.array("h")
@@ -168,21 +140,18 @@ async def prepare_file(fid: str) -> None:
             converted = False
         else:
             # Constant bit-rate so browser seeking is sample accurate.
-            code, _, err = await run("ffmpeg", "-y", "-v", "error", "-i", str(original), "-vn",
-                                     "-map", "0:a:0", "-c:a", "libmp3lame", "-b:a", MP3_BITRATE,
-                                     str(audio))
+            code, _, err = await asr.run("ffmpeg", "-y", "-v", "error", "-i", str(original), "-vn",
+                                         "-map", "0:a:0", "-c:a", "libmp3lame", "-b:a", cfg.MP3_BITRATE, str(audio))
             if code != 0:
                 raise RuntimeError(f"ffmpeg conversion failed: {err.decode(errors='ignore')[-300:]}")
             converted = True
+        original.unlink(missing_ok=True)  # the mp3 is the canonical copy
         ainfo = await probe(audio)
         duration = float(ainfo.get("format", {}).get("duration") or 0)
         write_json(d / "peaks.json", await compute_peaks(audio, duration))
-        if converted:
-            original.unlink(missing_ok=True)  # keep storage lean; the mp3 is the canonical copy
-        update_meta(fid, status="ready", duration=duration, converted=converted,
-                    source_format=source_format, error=None)
-        meta = load_meta(fid)
-        if meta.get("auto_transcribe", AUTO_TRANSCRIBE):
+        meta = update_meta(fid, status="ready", duration=duration, converted=converted,
+                           source_format=source_format, error=None)
+        if meta.get("auto_transcribe", cfg.AUTO_TRANSCRIBE):
             await enqueue(fid, meta.get("upload_opts") or {})
     except Exception as exc:  # noqa: BLE001
         log.exception("prepare failed for %s", fid)
@@ -190,152 +159,112 @@ async def prepare_file(fid: str) -> None:
 
 
 # --------------------------------------------------------------------------- #
-# Transcription
+# Jobs
 # --------------------------------------------------------------------------- #
 
 
-def upstream_headers() -> dict:
-    return {"Authorization": f"Bearer {LLAMA_SWAP_API_KEY}"} if LLAMA_SWAP_API_KEY else {}
+def set_progress(fid: str, **values: Any) -> None:
+    PROGRESS.setdefault(fid, {}).update(values)
 
 
-def _num(v: Any) -> Optional[float]:
-    return float(v) if isinstance(v, (int, float)) and not isinstance(v, bool) and math.isfinite(v) else None
+async def run_diarization(fid: str, audio: Path, num_speakers: int) -> list[tuple[float, float, int]]:
+    loop = asyncio.get_running_loop()
+    set_progress(fid, speakers=0.0)
+
+    def progress(frac: float) -> None:
+        loop.call_soon_threadsafe(lambda: set_progress(fid, speakers=round(frac, 3)))
+
+    t0 = time.time()
+    turns = await loop.run_in_executor(None, diarize.diarize, audio, num_speakers, progress)
+    log.info("speaker detection took %.1fs", time.time() - t0)
+    set_progress(fid, speakers=1.0)
+    return turns
 
 
-def normalize_transcript(raw: Any, duration: float) -> dict:
-    """Turn whatever the backend returned into our segment format with confidence data."""
-    if isinstance(raw, str):
-        raw = {"text": raw}
-    segments_in = raw.get("segments") or []
-    top_words = raw.get("words") or []
-
-    segments: list[dict] = []
-    for i, s in enumerate(segments_in):
-        start, end = _num(s.get("start")) or 0.0, _num(s.get("end")) or 0.0
-        words = []
-        for w in s.get("words") or []:
-            text = w.get("word", w.get("text", ""))
-            if not text or re.fullmatch(r"\s*\[_?[A-Z_]+_?\]\s*", text):
-                continue
-            words.append({"w": text, "s": _num(w.get("start")), "e": _num(w.get("end")),
-                          "p": _num(w.get("probability", w.get("p")))})
-        segments.append({
-            "id": i, "start": start, "end": max(end, start), "text": (s.get("text") or "").strip(),
-            "words": words, "avg_logprob": _num(s.get("avg_logprob")),
-            "no_speech_prob": _num(s.get("no_speech_prob")),
-            "compression_ratio": _num(s.get("compression_ratio")),
-        })
-
-    # OpenAI style: words are top-level, distribute them into segments by time.
-    if top_words and segments and not any(seg["words"] for seg in segments):
-        for w in top_words:
-            ws = _num(w.get("start")) or 0.0
-            for seg in segments:
-                if seg["start"] - 0.05 <= ws < seg["end"] + 0.05:
-                    seg["words"].append({"w": " " + w.get("word", "").strip(), "s": ws,
-                                         "e": _num(w.get("end")), "p": _num(w.get("probability"))})
-                    break
-
-    if not segments:
-        segments = [{"id": 0, "start": 0.0, "end": duration, "text": (raw.get("text") or "").strip(),
-                     "words": [], "avg_logprob": None, "no_speech_prob": None, "compression_ratio": None}]
-
-    prev_text = None
-    for seg in segments:
-        score_uncertainty(seg, prev_text)
-        prev_text = seg["text"].lower()
-        seg["reviewed"] = False
-        seg["edited"] = False
-
-    return {"language": raw.get("language"), "duration": _num(raw.get("duration")) or duration,
-            "segments": segments}
-
-
-def score_uncertainty(seg: dict, prev_text: Optional[str]) -> None:
-    probs = [w["p"] for w in seg["words"] if w["p"] is not None]
-    if probs:
-        # Mean word probability, pulled down a little by the weakest words.
-        mean = sum(probs) / len(probs)
-        low = sorted(probs)[: max(1, len(probs) // 5)]
-        conf = 0.75 * mean + 0.25 * (sum(low) / len(low))
-    elif seg["avg_logprob"] is not None:
-        conf = math.exp(seg["avg_logprob"])
-    else:
-        conf = None
-
-    issues = []
-    if seg["no_speech_prob"] is not None and seg["no_speech_prob"] > 0.6 and seg["text"]:
-        issues.append("Possibly no speech here (noise or silence transcribed)")
-    if seg["compression_ratio"] is not None and seg["compression_ratio"] > 2.4:
-        issues.append("Repetitive output, possible hallucination")
-    if prev_text and seg["text"] and seg["text"].lower() == prev_text and len(seg["text"]) > 8:
-        issues.append("Same text as the previous segment, possible hallucination")
-    if seg["end"] - seg["start"] > 1.5 and len(seg["text"].split()) / (seg["end"] - seg["start"]) > 7:
-        issues.append("Unusually fast speech for this span, words may be missing or invented")
-    low_words = [w["w"].strip() for w in seg["words"] if w["p"] is not None and w["p"] < WORD_THRESHOLD]
-    seg["confidence"] = round(conf, 4) if conf is not None else None
-    seg["issues"] = issues
-    seg["low_words"] = low_words[:12]
-
-
-async def call_transcription(audio: Path, opts: dict) -> Any:
-    model = opts.get("model") or DEFAULT_MODEL
-    base = {"model": model}
-    if opts.get("language") or DEFAULT_LANGUAGE:
-        base["language"] = opts.get("language") or DEFAULT_LANGUAGE
-    if opts.get("prompt"):
-        base["prompt"] = opts["prompt"]
-    attempts = [
-        {**base, "response_format": "verbose_json", "timestamp_granularities[]": ["segment", "word"]},
-        {**base, "response_format": "verbose_json"},
-        {**base, "response_format": "json"},
-    ]
-    url = f"{LLAMA_SWAP_URL}/v1/audio/transcriptions"
-    mime = "audio/wav" if audio.suffix == ".wav" else "audio/mpeg"
-    last_error = ""
-    async with httpx.AsyncClient(timeout=httpx.Timeout(REQUEST_TIMEOUT, connect=30)) as client:
-        for data in attempts:
-            with audio.open("rb") as fh:
-                r = await client.post(url, data=data, files={"file": (audio.name, fh, mime)},
-                                      headers=upstream_headers())
-            if r.status_code < 400:
-                try:
-                    return r.json()
-                except ValueError:
-                    return r.text
-            last_error = f"HTTP {r.status_code}: {r.text[:500]}"
-            if r.status_code not in (400, 415, 422):
-                break
-            log.warning("transcription attempt rejected (%s), retrying with fewer options", last_error)
-    raise RuntimeError(f"Transcription backend error ({last_error})")
-
-
-async def transcribe(fid: str, opts: dict) -> None:
+async def job_transcribe(fid: str, opts: dict) -> None:
     d = fdir(fid)
     meta = update_meta(fid, status="transcribing", started_at=time.time(), error=None,
-                       model=opts.get("model") or DEFAULT_MODEL)
+                       model=opts.get("model") or cfg.DEFAULT_MODEL)
     audio = d / "audio.mp3"
-    tmp_wav = d / "upstream.wav"
+    PROGRESS[fid] = {"stage": "starting"}
+    num_speakers = diarize.parse_speakers(opts.get("speakers")) if diarize.available() else None
+    diar_task: Optional[asyncio.Task] = None
     try:
-        if UPSTREAM_FORMAT == "wav":
-            code, _, err = await run("ffmpeg", "-y", "-v", "error", "-i", str(audio), "-ac", "1",
-                                     "-ar", "16000", "-c:a", "pcm_s16le", str(tmp_wav))
-            if code != 0:
-                raise RuntimeError(f"wav conversion failed: {err.decode(errors='ignore')[-300:]}")
-            audio = tmp_wav
         t0 = time.time()
-        raw = await call_transcription(audio, opts)
-        transcript = normalize_transcript(raw, meta.get("duration") or 0)
-        transcript.update(model=meta["model"], created=time.time())
+        if num_speakers is not None:  # CPU-bound; runs alongside the GPU transcription
+            diar_task = asyncio.create_task(run_diarization(fid, audio, num_speakers))
+        result = await asr.transcribe_file(audio, meta.get("duration") or 0, opts, d / "work",
+                                           lambda p: set_progress(fid, **p))
+        speakers: dict = {}
+        turns = None
+        if diar_task:
+            set_progress(fid, stage="speakers")
+            try:
+                turns = await diar_task
+            except Exception as exc:  # noqa: BLE001
+                log.exception("diarization failed for %s", fid)
+        words = asr.finalize_words(result["spans"], result["silences"], turns)
+        if turns:
+            speakers = asr.assign_speakers(words, turns)
+        segments = asr.build_segments(words)
+        asr.score_segments(segments)
+        transcript = {"model": result["model"], "api": result["api"], "created": time.time(),
+                      "duration": meta.get("duration"), "speakers": speakers, "segments": segments,
+                      "timing": "estimated" if any(w.get("est") for w in words) else "model"}
         write_json(d / "transcript.orig.json", transcript)
         write_json(d / "transcript.json", transcript)
-        update_meta(fid, status="done", transcribed_at=time.time(),
-                    transcribe_seconds=round(time.time() - t0, 1), language=transcript.get("language"))
+        update_meta(fid, status="done", transcribed_at=time.time(), transcribe_seconds=round(time.time() - t0, 1),
+                    api=result["api"], chunks=result["chunks"], speaker_count=len(speakers))
     except Exception as exc:  # noqa: BLE001
         log.exception("transcription failed for %s", fid)
-        update_meta(fid, status="error", error=str(exc))
+        if diar_task and not diar_task.done():
+            diar_task.cancel()
+        msg = str(exc)
+        if isinstance(exc, asr.ContextTooLarge):
+            msg = f"Audio chunk too large for the model's context even after splitting: {msg[:300]}"
+        update_meta(fid, status="error", error=msg)
     finally:
-        tmp_wav.unlink(missing_ok=True)
+        PROGRESS.pop(fid, None)
+        shutil.rmtree(d / "work", ignore_errors=True)
+
+
+async def job_diarize(fid: str, opts: dict) -> None:
+    """Re-detect speakers on an existing (possibly edited) transcript without re-transcribing."""
+    d = fdir(fid)
+    prev_status = "done"
+    update_meta(fid, status="diarizing", started_at=time.time(), error=None)
+    PROGRESS[fid] = {"stage": "speakers"}
+    try:
+        n = diarize.parse_speakers(opts.get("speakers") or "auto") or -1
+        turns = await run_diarization(fid, d / "audio.mp3", n)
+        t = read_json(d / "transcript.json")
+        segs = t["segments"]
+        # Assign per segment by majority overlap (keeps the user's segment edits intact).
+        pseudo = [{"w": s["text"] + ".", "s": s["start"], "e": max(s["end"], s["start"] + 0.05)} for s in segs]
+        speakers = asr.assign_speakers(pseudo, turns)
+        # Carry user-given names over: each new speaker inherits the old speaker it overlaps most.
+        old_names = {k: v.get("name") for k, v in (t.get("speakers") or {}).items()}
+        overlap: dict[tuple[str, str], float] = {}
+        for s, p in zip(segs, pseudo):
+            if s.get("speaker") and p.get("spk"):
+                key = (p["spk"], s["speaker"])
+                overlap[key] = overlap.get(key, 0.0) + (s["end"] - s["start"])
+        used: set[str] = set()
+        for (new, old), _ in sorted(overlap.items(), key=lambda kv: -kv[1]):
+            if new in speakers and old not in used and not speakers[new].get("_named") and old_names.get(old):
+                speakers[new] = {"name": old_names[old], "_named": True}
+                used.add(old)
+        speakers = {k: {"name": v["name"]} for k, v in speakers.items()}
+        for s, p in zip(segs, pseudo):
+            s["speaker"] = p.get("spk")
+        t["speakers"] = speakers
+        write_json(d / "transcript.json", t)
+        update_meta(fid, status=prev_status, speaker_count=len(speakers))
+    except Exception as exc:  # noqa: BLE001
+        log.exception("diarization failed for %s", fid)
+        update_meta(fid, status=prev_status, error=f"Speaker detection failed: {exc}")
+    finally:
+        PROGRESS.pop(fid, None)
 
 
 async def enqueue(fid: str, opts: dict) -> None:
@@ -347,8 +276,13 @@ async def worker() -> None:
     while True:
         fid, opts = await queue.get()
         try:
-            if (fdir(fid) / "meta.json").exists():
-                await transcribe(fid, opts)
+            if (cfg.FILES_DIR / fid / "audio.mp3").exists():
+                if opts.get("job") == "diarize":
+                    await job_diarize(fid, opts)
+                else:
+                    await job_transcribe(fid, opts)
+            elif (cfg.FILES_DIR / fid / "meta.json").exists():
+                update_meta(fid, status="error", error="Audio file is missing")
         except Exception:  # noqa: BLE001
             log.exception("worker error")
         finally:
@@ -366,22 +300,20 @@ def spawn(coro) -> None:
 
 @asynccontextmanager
 async def lifespan(_app: FastAPI):
-    FILES_DIR.mkdir(parents=True, exist_ok=True)
+    cfg.FILES_DIR.mkdir(parents=True, exist_ok=True)
     spawn(worker())
-    # Recover work interrupted by a container restart.
-    for meta_path in sorted(FILES_DIR.glob("*/meta.json")):
+    for meta_path in sorted(cfg.FILES_DIR.glob("*/meta.json")):  # recover interrupted work
         meta = read_json(meta_path)
         if not meta:
             continue
         if meta.get("status") == "processing":
             spawn(prepare_file(meta["id"]))
-        elif meta.get("status") in ("queued", "transcribing"):
+        elif meta.get("status") in ("queued", "transcribing", "diarizing"):
             await enqueue(meta["id"], meta.get("queued_opts") or {})
     yield
 
 
 app = FastAPI(title="TranscribeR", lifespan=lifespan)
-
 
 # --------------------------------------------------------------------------- #
 # API
@@ -393,51 +325,48 @@ async def config() -> dict:
     models: list[str] = []
     error = None
     try:
-        async with httpx.AsyncClient(timeout=5) as client:
-            r = await client.get(f"{LLAMA_SWAP_URL}/v1/models", headers=upstream_headers())
-            r.raise_for_status()
-            models = sorted(m.get("id") for m in r.json().get("data", []) if m.get("id"))
+        models = sorted(m["id"] for m in await asr.list_models())
     except Exception as exc:  # noqa: BLE001
-        error = f"Could not reach llama-swap at {LLAMA_SWAP_URL}: {exc}"
-    return {"models": models, "default_model": DEFAULT_MODEL, "default_language": DEFAULT_LANGUAGE,
-            "uncertainty_threshold": UNCERTAINTY_THRESHOLD, "word_threshold": WORD_THRESHOLD,
-            "auto_transcribe": AUTO_TRANSCRIBE, "backend": LLAMA_SWAP_URL, "backend_error": error}
+        error = f"Could not reach llama-swap at {cfg.LLAMA_SWAP_URL}: {exc}"
+    return {"models": models, "default_model": cfg.DEFAULT_MODEL, "default_language": cfg.DEFAULT_LANGUAGE,
+            "uncertainty_threshold": cfg.UNCERTAINTY_THRESHOLD, "word_threshold": cfg.WORD_THRESHOLD,
+            "auto_transcribe": cfg.AUTO_TRANSCRIBE, "backend": cfg.LLAMA_SWAP_URL, "backend_error": error,
+            "diarization_available": diarize.available(), "diarization_default": cfg.DIARIZATION}
 
 
 @app.get("/api/files")
 async def list_files() -> list[dict]:
-    metas = [read_json(p) for p in FILES_DIR.glob("*/meta.json")]
+    metas = [read_json(p) for p in cfg.FILES_DIR.glob("*/meta.json")]
     metas = [public_meta(m) for m in metas if m]
     return sorted(metas, key=lambda m: m.get("created", 0), reverse=True)
 
 
 @app.post("/api/files")
 async def upload(file: UploadFile = File(...), model: Optional[str] = Form(None),
-                 language: Optional[str] = Form(None), prompt: Optional[str] = Form(None),
+                 language: Optional[str] = Form(None), speakers: Optional[str] = Form(None),
                  auto: Optional[bool] = Form(None)) -> dict:
     fid = uuid.uuid4().hex
-    d = FILES_DIR / fid
+    d = cfg.FILES_DIR / fid
     d.mkdir(parents=True)
     name = Path(file.filename or "audio").name
     ext = re.sub(r"[^a-z0-9]", "", Path(name).suffix.lower())[:8] or "bin"
     original = f"original.{ext}"
     size = 0
-    limit = MAX_UPLOAD_MB * 1024 * 1024
+    limit = cfg.MAX_UPLOAD_MB * 1024 * 1024
     try:
         with (d / original).open("wb") as out:
             while chunk := await file.read(1024 * 1024):
                 size += len(chunk)
                 if size > limit:
-                    raise HTTPException(413, f"File exceeds {MAX_UPLOAD_MB} MB limit")
+                    raise HTTPException(413, f"File exceeds {cfg.MAX_UPLOAD_MB} MB limit")
                 out.write(chunk)
     except BaseException:
         shutil.rmtree(d, ignore_errors=True)
         raise
-    meta = {"id": fid, "name": name, "original_file": original, "size": size,
-            "created": time.time(), "status": "processing", "error": None,
-            "auto_transcribe": AUTO_TRANSCRIBE if auto is None else auto,
-            "upload_opts": {k: v for k, v in {"model": model, "language": language,
-                                              "prompt": prompt}.items() if v}}
+    opts = {k: v for k, v in {"model": model, "language": language, "speakers": speakers}.items() if v}
+    meta = {"id": fid, "name": name, "original_file": original, "size": size, "created": time.time(),
+            "status": "processing", "error": None,
+            "auto_transcribe": cfg.AUTO_TRANSCRIBE if auto is None else auto, "upload_opts": opts}
     write_json(d / "meta.json", meta)
     spawn(prepare_file(fid))
     return public_meta(meta)
@@ -466,14 +395,48 @@ async def delete_file(fid: str) -> dict:
     if not d.exists():
         raise HTTPException(404, "File not found")
     shutil.rmtree(d, ignore_errors=True)
+    PROGRESS.pop(fid, None)
     return {"ok": True}
+
+
+@app.delete("/api/files/{fid}/audio")
+async def delete_audio(fid: str) -> dict:
+    """Free up space: remove the audio but keep the transcript."""
+    meta = load_meta(fid)
+    if meta["status"] in ACTIVE_STATES:
+        raise HTTPException(409, f"File is {meta['status']}, try again when it has finished")
+    d = fdir(fid)
+    for name in ("audio.mp3", "peaks.json", meta.get("original_file") or ""):
+        if name:
+            (d / name).unlink(missing_ok=True)
+    return public_meta(update_meta(fid, audio_deleted=True, size=0))
+
+
+class BulkDelete(BaseModel):
+    ids: list[str]
+    audio_only: bool = False
+
+
+@app.post("/api/files/delete")
+async def bulk_delete(body: BulkDelete) -> dict:
+    done, skipped = [], []
+    for fid in body.ids:
+        try:
+            if body.audio_only:
+                await delete_audio(fid)
+            else:
+                await delete_file(fid)
+            done.append(fid)
+        except HTTPException:
+            skipped.append(fid)
+    return {"deleted": done, "skipped": skipped}
 
 
 @app.get("/api/files/{fid}/audio")
 async def get_audio(fid: str) -> FileResponse:
     path = fdir(fid) / "audio.mp3"
     if not path.exists():
-        raise HTTPException(404, "Audio not ready")
+        raise HTTPException(404, "Audio not available")
     return FileResponse(path, media_type="audio/mpeg")
 
 
@@ -486,6 +449,7 @@ class TranscribeBody(BaseModel):
     model: Optional[str] = None
     language: Optional[str] = None
     prompt: Optional[str] = None
+    speakers: Optional[str] = None
 
 
 @app.post("/api/files/{fid}/transcribe")
@@ -494,8 +458,25 @@ async def start_transcription(fid: str, body: TranscribeBody) -> dict:
     if meta["status"] in ACTIVE_STATES:
         raise HTTPException(409, f"File is already {meta['status']}")
     if not (fdir(fid) / "audio.mp3").exists():
-        raise HTTPException(409, "Audio is not ready")
+        raise HTTPException(409, "Audio is not available")
     await enqueue(fid, body.model_dump(exclude_none=True))
+    return public_meta(load_meta(fid))
+
+
+class DiarizeBody(BaseModel):
+    speakers: Optional[str] = "auto"
+
+
+@app.post("/api/files/{fid}/diarize")
+async def start_diarize(fid: str, body: DiarizeBody) -> dict:
+    meta = load_meta(fid)
+    if not diarize.available():
+        raise HTTPException(501, "Speaker detection models are not installed in this image")
+    if meta["status"] in ACTIVE_STATES:
+        raise HTTPException(409, f"File is already {meta['status']}")
+    if not (fdir(fid) / "audio.mp3").exists() or not (fdir(fid) / "transcript.json").exists():
+        raise HTTPException(409, "Needs both audio and a transcript")
+    await enqueue(fid, {"job": "diarize", "speakers": body.speakers or "auto"})
     return public_meta(load_meta(fid))
 
 
@@ -504,21 +485,17 @@ async def get_transcript(fid: str) -> dict:
     t = read_json(fdir(fid) / "transcript.json")
     if t is None:
         raise HTTPException(404, "No transcript yet")
+    t.setdefault("speakers", {})
     return t
 
 
-class SegmentIn(BaseModel):
-    id: int
-    start: float
-    end: float
-    text: str
-    reviewed: bool = False
-    edited: bool = False
-    words: Optional[list] = None
+SEG_KEYS = {"id", "start", "end", "text", "speaker", "words", "reviewed", "edited",
+            "confidence", "issues", "low_words"}
 
 
 class TranscriptIn(BaseModel):
-    segments: list[SegmentIn]
+    segments: list[dict]
+    speakers: Optional[dict] = None
 
 
 @app.put("/api/files/{fid}/transcript")
@@ -527,15 +504,18 @@ async def save_transcript(fid: str, body: TranscriptIn) -> dict:
     t = read_json(path)
     if t is None:
         raise HTTPException(404, "No transcript yet")
-    by_id = {s["id"]: s for s in t["segments"]}
+    segs = []
     for s in body.segments:
-        seg = by_id.get(s.id)
-        if seg is None:
-            continue
-        seg.update(text=s.text, reviewed=s.reviewed, edited=s.edited, start=s.start, end=s.end)
-        if s.words is not None:
-            seg["words"] = s.words
-    t["segments"] = sorted(by_id.values(), key=lambda s: s["start"])
+        try:
+            seg = {k: v for k, v in s.items() if k in SEG_KEYS}
+            seg["start"], seg["end"] = float(seg["start"]), float(seg["end"])
+            seg["text"] = str(seg.get("text", ""))
+            segs.append(seg)
+        except (KeyError, TypeError, ValueError):
+            raise HTTPException(422, "Invalid segment") from None
+    t["segments"] = sorted(segs, key=lambda s: s["start"])
+    if body.speakers is not None:
+        t["speakers"] = {str(k): {"name": str((v or {}).get("name", k))[:80]} for k, v in body.speakers.items()}
     t["updated"] = time.time()
     write_json(path, t)
     return {"ok": True, "updated": t["updated"]}
@@ -548,46 +528,59 @@ async def revert_transcript(fid: str) -> dict:
     if orig is None:
         raise HTTPException(404, "No original transcript")
     write_json(d / "transcript.json", orig)
+    orig.setdefault("speakers", {})
     return orig
 
 
 # ---- exports -------------------------------------------------------------- #
 
 
-def ts(sec: float, sep: str = ".", hours: bool = True, ms: bool = True) -> str:
+def ts(sec: float, sep: str = ".", ms: bool = True) -> str:
     sec = max(0.0, sec)
     h, rem = divmod(int(sec), 3600)
     m, s = divmod(rem, 60)
     frac = f"{sep}{int(round((sec - int(sec)) * 1000)) % 1000:03d}" if ms else ""
-    return (f"{h:02d}:" if hours or h else "") + f"{m:02d}:{s:02d}{frac}"
+    return f"{h:02d}:{m:02d}:{s:02d}{frac}"
 
 
 def render_export(t: dict, fmt: str) -> tuple[str, str, str]:
     segs = [s for s in t["segments"] if s["text"].strip()]
+    names = {k: v.get("name") or k for k, v in (t.get("speakers") or {}).items()}
+
+    def who(s: dict) -> Optional[str]:
+        return names.get(s.get("speaker") or "", None)
+
     if fmt == "txt":
-        paras, cur, last_end = [], [], None
-        for s in segs:  # start a new paragraph on long pauses
-            if last_end is not None and s["start"] - last_end > 2.0 and cur:
+        paras: list[str] = []
+        cur: list[str] = []
+        last_end, last_spk = None, object()
+        for s in segs:  # new paragraph on speaker change or long pause
+            spk = who(s)
+            if cur and (spk != last_spk or (last_end is not None and s["start"] - last_end > 2.0)):
                 paras.append(" ".join(cur))
                 cur = []
+            if not cur and spk:
+                cur.append(f"{spk}:")
             cur.append(s["text"].strip())
-            last_end = s["end"]
+            last_end, last_spk = s["end"], spk
         if cur:
             paras.append(" ".join(cur))
         return "\n\n".join(paras) + "\n", "txt", "text/plain"
     if fmt == "timestamps":
-        lines = [f"[{ts(s['start'], ms=False)} - {ts(s['end'], ms=False)}] {s['text'].strip()}" for s in segs]
+        lines = [f"[{ts(s['start'], ms=False)} - {ts(s['end'], ms=False)}] "
+                 f"{who(s) + ': ' if who(s) else ''}{s['text'].strip()}" for s in segs]
         return "\n".join(lines) + "\n", "timestamps.txt", "text/plain"
     if fmt == "srt":
-        blocks = [f"{i}\n{ts(s['start'], ',')} --> {ts(s['end'], ',')}\n{s['text'].strip()}\n"
-                  for i, s in enumerate(segs, 1)]
+        blocks = [f"{i}\n{ts(s['start'], ',')} --> {ts(s['end'], ',')}\n"
+                  f"{'[' + who(s) + '] ' if who(s) else ''}{s['text'].strip()}\n" for i, s in enumerate(segs, 1)]
         return "\n".join(blocks), "srt", "application/x-subrip"
     if fmt == "vtt":
-        blocks = [f"{ts(s['start'])} --> {ts(s['end'])}\n{s['text'].strip()}\n" for s in segs]
+        blocks = [f"{ts(s['start'])} --> {ts(s['end'])}\n"
+                  f"{'<v ' + who(s) + '>' if who(s) else ''}{s['text'].strip()}\n" for s in segs]
         return "WEBVTT\n\n" + "\n".join(blocks), "vtt", "text/vtt"
     if fmt == "json":
-        out = {"language": t.get("language"), "model": t.get("model"),
-               "segments": [{"start": s["start"], "end": s["end"], "text": s["text"].strip(),
+        out = {"model": t.get("model"), "speakers": names,
+               "segments": [{"start": s["start"], "end": s["end"], "speaker": who(s), "text": s["text"].strip(),
                              "confidence": s.get("confidence"), "reviewed": s.get("reviewed", False)}
                             for s in segs]}
         return json.dumps(out, indent=2, ensure_ascii=False), "json", "application/json"

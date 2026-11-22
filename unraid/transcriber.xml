@@ -9,7 +9,7 @@
   <Privileged>false</Privileged>
   <Support>https://github.com/strid3r21/TranscribeR</Support>
   <Project>https://github.com/strid3r21/TranscribeR</Project>
-  <Overview>Web UI for transcribing audio through a llama-swap hosted speech-to-text model (whisper.cpp, faster-whisper, etc). Upload audio (auto converted to MP3), follow a synced timestamped transcript while it plays, edit it inline, review segments flagged as uncertain, and export plain text, timestamped text, SRT, VTT or JSON.</Overview>
+  <Overview>Web UI for transcribing audio through a llama-swap hosted speech-to-text model (whisper.cpp, Nemotron/llama-server audio models, faster-whisper, etc). Long files are chunked automatically, speakers are detected on the CPU and can be named. Upload audio (auto converted to MP3), follow a synced timestamped transcript while it plays, edit it inline, review segments flagged as uncertain, and export plain text, timestamped text, SRT, VTT or JSON.</Overview>
   <Category>MediaApp:Other Productivity: Tools:</Category>
   <WebUI>http://[IP]:[PORT:8000]/</WebUI>
   <TemplateURL/>
@@ -29,7 +29,14 @@
   <Config Name="Default language" Target="DEFAULT_LANGUAGE" Default="" Mode="" Description="ISO code like en. Empty = auto detect" Type="Variable" Display="advanced" Required="false" Mask="false"/>
   <Config Name="Auto transcribe" Target="AUTO_TRANSCRIBE" Default="true" Mode="" Description="Default for the auto-transcribe toggle" Type="Variable" Display="advanced" Required="false" Mask="false">true</Config>
   <Config Name="Upstream format" Target="UPSTREAM_FORMAT" Default="mp3" Mode="" Description="Format sent to the model: mp3, or wav (16kHz mono) if your backend cannot decode mp3" Type="Variable" Display="advanced" Required="false" Mask="false">mp3</Config>
-  <Config Name="Request timeout" Target="REQUEST_TIMEOUT" Default="3600" Mode="" Description="Seconds to wait for a transcription (long files on CPU can be slow)" Type="Variable" Display="advanced" Required="false" Mask="false">3600</Config>
+  <Config Name="Speaker detection" Target="DIARIZATION" Default="auto" Mode="" Description="Default for the Speakers selector: off, auto, or a fixed number of speakers. Runs on the CPU." Type="Variable" Display="always" Required="false" Mask="false">auto</Config>
+  <Config Name="Chunk seconds" Target="CHUNK_SECONDS" Default="30" Mode="" Description="Long audio is split at pauses into chunks of about this length (keeps each request inside the model's context). 0 = send whole file." Type="Variable" Display="advanced" Required="false" Mask="false">30</Config>
+  <Config Name="Chunk concurrency" Target="CHUNK_CONCURRENCY" Default="1" Mode="" Description="Chunks sent to llama-swap in parallel. Raise only if your llama-server has multiple slots (--parallel)." Type="Variable" Display="advanced" Required="false" Mask="false">1</Config>
+  <Config Name="Transcription API" Target="TRANSCRIBE_API" Default="auto" Mode="" Description="auto, chat or transcriptions. auto uses chat completions (gives word confidence) for audio-capable llama-server models." Type="Variable" Display="advanced" Required="false" Mask="false">auto</Config>
+  <Config Name="Chat prompt" Target="CHAT_PROMPT" Default="Transcribe the speech in this audio verbatim. Output only the transcript text." Mode="" Description="Instruction sent with each chunk in chat mode" Type="Variable" Display="advanced" Required="false" Mask="false">Transcribe the speech in this audio verbatim. Output only the transcript text.</Config>
+  <Config Name="Speaker threshold" Target="DIARIZE_THRESHOLD" Default="0.7" Mode="" Description="Clustering threshold for Auto speaker count. Higher = fewer speakers. Lower it if different people get merged." Type="Variable" Display="advanced" Required="false" Mask="false">0.7</Config>
+  <Config Name="Speaker CPU threads" Target="DIARIZE_THREADS" Default="4" Mode="" Description="CPU threads used for speaker detection" Type="Variable" Display="advanced" Required="false" Mask="false">4</Config>
+  <Config Name="Request timeout" Target="REQUEST_TIMEOUT" Default="1800" Mode="" Description="Seconds to wait for one chunk" Type="Variable" Display="advanced" Required="false" Mask="false">1800</Config>
   <Config Name="Uncertainty threshold" Target="UNCERTAINTY_THRESHOLD" Default="0.70" Mode="" Description="Default segment confidence below which a segment is flagged (adjustable in UI)" Type="Variable" Display="advanced" Required="false" Mask="false">0.70</Config>
   <Config Name="Word threshold" Target="WORD_THRESHOLD" Default="0.45" Mode="" Description="Word probability below which a word is underlined" Type="Variable" Display="advanced" Required="false" Mask="false">0.45</Config>
   <Config Name="Max upload MB" Target="MAX_UPLOAD_MB" Default="4096" Mode="" Description="Upload size limit" Type="Variable" Display="advanced" Required="false" Mask="false">4096</Config>

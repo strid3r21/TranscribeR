@@ -14,6 +14,8 @@ services:
       # LLAMA_SWAP_API_KEY: ""
       # DEFAULT_LANGUAGE: en
       # UPSTREAM_FORMAT: mp3                     # set to wav if your backend can't decode mp3
+      # DIARIZATION: auto                       # off | auto | number of speakers
+      # CHUNK_SECONDS: "30"
       # AUTO_TRANSCRIBE: "true"
       # UNCERTAINTY_THRESHOLD: "0.70"
       # WORD_THRESHOLD: "0.45"
