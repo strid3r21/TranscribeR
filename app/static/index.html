@@ -169,8 +169,14 @@
 
           <aside class="side">
           <section class="speakers card hidden" id="speakersCard">
-            <div class="card-head"><span>Speakers</span><button class="btn icon sm" id="addSpeaker" title="Add speaker">+</button></div>
+            <div class="card-head"><span>Speakers</span>
+              <div class="nav">
+                <button class="btn sm" id="teachBtn" title="Tag a few clips so it learns each voice">Teach</button>
+                <button class="btn icon sm" id="addSpeaker" title="Add speaker">+</button>
+              </div>
+            </div>
             <ul class="speaker-list" id="speakerList"></ul>
+            <div class="spk-foot" id="spkFoot"></div>
           </section>
           <section class="review card" id="reviewCard">
             <div class="card-head">
@@ -201,6 +207,34 @@
     </div>
     <div id="spkMenuList"></div>
     <button class="spk-new" id="spkNew">+ New speaker</button>
+  </div>
+  <div class="modal hidden" id="trainer" role="dialog" aria-modal="true" aria-labelledby="trTitle">
+    <div class="modal-card">
+      <div class="modal-head">
+        <h3 id="trTitle">Teach speakers</h3>
+        <button class="btn icon sm" id="trClose" title="Close">✕</button>
+      </div>
+      <div class="modal-body">
+        <section>
+          <div class="tr-label"><b>1</b> Who is speaking in this file?</div>
+          <div class="tr-people" id="trPeople"></div>
+          <div class="tr-row">
+            <button class="btn sm" id="trAddPerson">+ Add person</button>
+            <span class="tr-saved" id="trSaved"></span>
+          </div>
+        </section>
+        <section>
+          <div class="tr-label"><b>2</b> Tag a few clips <span class="tr-counts" id="trCounts"></span></div>
+          <p class="muted tr-hint">Play each clip and pick who's talking. Two or three per person is usually enough. People with a remembered voice don't need any.</p>
+          <ul class="tr-clips" id="trClips"></ul>
+          <button class="btn sm ghost" id="trMore">More clips</button>
+        </section>
+      </div>
+      <div class="modal-foot">
+        <label class="toggle"><input type="checkbox" id="trRemember" checked><span class="switch"></span><span>Remember these voices for future files</span></label>
+        <button class="btn primary" id="trApply" disabled>Apply to whole file</button>
+      </div>
+    </div>
   </div>
   <div class="toast" id="toast"></div>
   <script src="app.js"></script>

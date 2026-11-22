@@ -40,6 +40,9 @@
     selected: new Set(),
     spkTarget: null,
     spkScope: "seg",
+    voices: [],
+    stopAt: null,
+    tr: null, // trainer state
   };
 
   const audio = $("audio");
@@ -153,7 +156,8 @@
     if (prev.status !== f.status && !S.segs.length) renderSegments();
     if (isBusy(prev) && !isBusy(f) && f.has_transcript) {
       await loadTranscript();
-      if (f.status === "done") toast(prev.status === "diarizing" ? "Speakers updated" : "Transcription finished");
+      if (f.status === "done" && !f.error) toast(prev.status === "diarizing" ? speakerToast(f) : "Transcription finished");
+      if (prev.status === "diarizing") loadVoices();
     }
     if (prev.status === "processing" && f.status !== "processing") loadAudio();
   }
@@ -393,8 +397,8 @@
     if (f.status === "processing") { $("procTitle").textContent = "Preparing audio…"; $("procDetail").textContent = "Checking the format and converting to MP3 if needed"; return; }
     if (f.status === "queued") { $("procTitle").textContent = "Queued"; $("procDetail").textContent = "Waiting for the current job to finish"; return; }
     if (f.status === "diarizing") {
-      $("procTitle").textContent = "Detecting speakers…";
-      $("procDetail").textContent = `${fmt(f.elapsed || 0)} elapsed · runs on the server CPU`;
+      $("procTitle").textContent = p.stage === "voices" ? "Matching voices…" : "Detecting speakers…";
+      $("procDetail").textContent = `${fmt(f.elapsed || 0)} elapsed · ${p.label || "runs on the server CPU"}`;
     } else {
       $("procTitle").textContent = `Transcribing with ${f.model || "model"}…`;
       let detail = `${fmt(f.elapsed || 0)} elapsed`;
@@ -489,7 +493,8 @@
   function renderSpeakers() {
     const card = $("speakersCard");
     const ids = Object.keys(S.speakers);
-    card.classList.toggle("hidden", !ids.length || !S.segs.length);
+    card.classList.toggle("hidden", !S.segs.length || (!ids.length && !S.config?.diarization_available));
+    $("teachBtn").classList.toggle("hidden", !S.config?.diarization_available || !S.current?.has_audio);
     const list = $("speakerList");
     list.innerHTML = "";
     const talk = {};
@@ -510,9 +515,40 @@
       share.style.background = spkColor(id);
       share.style.width = total ? Math.max(2, ((talk[id] || 0) / total) * 100) + "%" : "0";
       box.append(input, share);
-      li.append(sw, box, el("small", null, `${fmt(talk[id] || 0)} · ${total ? Math.round(((talk[id] || 0) / total) * 100) : 0}%`));
+      const stat = el("small", null, `${fmt(talk[id] || 0)} · ${total ? Math.round(((talk[id] || 0) / total) * 100) : 0}%`);
+      if (hasVoice(spkName(id))) { const b = el("span", "voice-badge", "VOICE SAVED"); b.title = "This voice is remembered and recognized in future files"; stat.prepend(b, document.createElement("br")); }
+      li.append(sw, box, stat);
       list.append(li);
     }
+    if (!ids.length) list.append(el("li", "muted", "No speakers yet. Click Teach to tag who's talking."));
+    const foot = $("spkFoot");
+    foot.innerHTML = "";
+    const tagged = S.segs.filter((s) => s.spk_locked).length;
+    const unsure = S.segs.filter((s) => (s.issues || []).some((x) => x.startsWith("Not sure who"))).length;
+    if (tagged && ids.length >= 2 && S.current?.has_audio && S.config?.diarization_available) {
+      const b = el("button", "btn sm primary", `Update all from my corrections (${tagged})`);
+      b.title = "Re-label every line by voice, using the lines you've tagged or corrected as examples";
+      b.onclick = () => runIdentify(true);
+      foot.append(b);
+    }
+    if (unsure) foot.append(el("small", null, `${unsure} line${unsure > 1 ? "s" : ""} where the speaker is unclear are in Needs review. Fixing them teaches it more.`));
+  }
+  const hasVoice = (name) => !!name && S.voices.some((v) => v.name.trim().toLowerCase() === name.trim().toLowerCase());
+  async function loadVoices() {
+    try { S.voices = await api("/api/voices"); } catch { S.voices = []; }
+    renderSpeakers();
+  }
+  function speakerToast(f) {
+    const r = f.last_identify;
+    if (r && Date.now() / 1000 - r.at < 60) return `Speakers updated: ${r.changed} line${r.changed === 1 ? "" : "s"} relabeled` + (r.unsure ? `, ${r.unsure} unclear` : "");
+    return "Speakers updated";
+  }
+  async function runIdentify(remember) {
+    try {
+      await flushSave();
+      S.current = await api(`/api/files/${S.current.id}/identify`, { method: "POST", body: JSON.stringify({ remember }) });
+      renderHeader(); await loadFiles(); schedulePoll();
+    } catch (e) { toast(e.message, true); }
   }
   function newSpeakerId() {
     let n = Object.keys(S.speakers).length + 1;
@@ -571,7 +607,11 @@
     const i = S.spkTarget;
     if (i == null) return;
     const [a, b] = S.spkScope === "turn" ? turnRange(i) : [i, i];
-    for (let k = a; k <= b; k++) S.segs[k].speaker = id;
+    for (let k = a; k <= b; k++) {
+      const s = S.segs[k];
+      s.speaker = id; s.spk_locked = true; s.spk_conf = 1;
+      s.issues = (s.issues || []).filter((x) => !x.startsWith("Not sure who"));
+    }
     hideSpkMenu();
     renderSegments(); renderSpeakers(); queueSave();
   }
@@ -661,9 +701,10 @@
       if (s.speaker) { row.dataset.spk = s.speaker; row.style.setProperty("--spk", spkColor(s.speaker)); }
       const left = el("div", "seg-left");
       if (hasSpk) {
-        const chip = el("button", "spk-chip" + (turnStart ? "" : " minor"), s.speaker ? spkName(s.speaker) : "Unassigned");
+        const unsure = !s.spk_locked && s.spk_conf != null && s.spk_conf < 0.08;
+        const chip = el("button", "spk-chip" + (turnStart && !unsure ? "" : unsure ? " unsure" : " minor"), s.speaker ? spkName(s.speaker) : "Unassigned");
         if (s.speaker) chip.dataset.spk = s.speaker;
-        chip.title = "Change speaker";
+        chip.title = s.spk_locked ? "Tagged by you · click to change" : unsure ? "Not sure who this is · click to set" : "Change speaker";
         chip.onclick = (e) => { e.stopPropagation(); showSpkMenu(i, chip, turnStart); };
         left.append(chip);
       }
@@ -871,6 +912,7 @@
         id: s.id, start: s.start, end: s.end, text: s.text, speaker: s.speaker ?? null,
         reviewed: !!s.reviewed, edited: !!s.edited, words: s.words || [],
         confidence: s.confidence ?? null, issues: s.issues || [], low_words: s.low_words || [],
+        ...(s.spk_locked ? { spk_locked: true } : {}), ...(s.spk_conf != null ? { spk_conf: s.spk_conf } : {}),
       })),
       speakers: S.speakers,
     };
@@ -979,6 +1021,7 @@
   }
   function togglePlay() {
     if (!audio.getAttribute("src")) return;
+    S.stopAt = null;
     S.resumeAfterTyping = false; clearTimeout(S.typingTimer);
     if (audio.paused) audio.play().catch((e) => toast(e.message, true)); else audio.pause();
   }
@@ -996,12 +1039,13 @@
 
   const PLAY = '<path d="M8 5v14l11-7z"/>', PAUSE = '<path d="M7 5h3.5v14H7zM13.5 5H17v14h-3.5z"/>';
   audio.addEventListener("play", () => { $("playIcon").innerHTML = PAUSE; tick(); });
-  audio.addEventListener("pause", () => { $("playIcon").innerHTML = PLAY; drawWave(); });
+  audio.addEventListener("pause", () => { $("playIcon").innerHTML = PLAY; drawWave(); if (S.tr) trPlaying(null); });
   audio.addEventListener("loadedmetadata", () => { $("durTime").textContent = fmt(audio.duration); drawWave(); });
   audio.addEventListener("timeupdate", () => { if (audio.paused) { updateActive(); drawWave(); } });
   audio.addEventListener("error", () => { if (audio.getAttribute("src")) toast("Could not load audio", true); });
 
   function tick() {
+    if (S.stopAt != null && audio.currentTime >= S.stopAt) { audio.pause(); S.stopAt = null; trPlaying(null); }
     updateActive();
     drawWave();
     if (!audio.paused) requestAnimationFrame(tick);
@@ -1134,10 +1178,211 @@
   new ResizeObserver(() => drawWave()).observe(waveWrap);
   matchMedia("(prefers-color-scheme: light)").addEventListener("change", () => { waveColors = null; drawWave(); });
 
+  // ------------------------------------------------------------------ teach speakers
+  const PLAY_ICON = '<svg viewBox="0 0 24 24"><path d="M8 5v14l11-7z"/></svg>';
+  const STOP_ICON = '<svg viewBox="0 0 24 24"><path d="M7 7h10v10H7z"/></svg>';
+
+  function openTrainer() {
+    if (!S.segs.length || !S.current?.has_audio) return;
+    const existing = Object.entries(S.speakers);
+    let people;
+    if (existing.length >= 2 && existing.length <= 6) {
+      people = existing.map(([id, v]) => ({ id, name: v.name || id }));
+    } else {
+      const sel = parseInt($("speakersSelect").value, 10);
+      const n = Number.isFinite(sel) && sel >= 2 ? sel : 2;
+      const saved = [...S.voices].sort((a, b) => b.n - a.n);
+      people = Array.from({ length: n }, (_, k) => ({ id: "S" + (k + 1), name: saved[k]?.name || `Speaker ${k + 1}` }));
+    }
+    S.tr = { people, tags: new Map(), clips: [], playing: null };
+    // pre-fill tags from lines the user already tagged/corrected
+    S.segs.forEach((s, i) => { if (s.spk_locked && people.some((p) => p.id === s.speaker)) S.tr.tags.set(i, s.speaker); });
+    S.tr.clips = [...S.tr.tags.keys()].slice(0, 6);
+    addClips(8);
+    $("trainer").classList.remove("hidden");
+    renderTrainer();
+  }
+  function closeTrainer() {
+    if (S.stopAt != null) { audio.pause(); S.stopAt = null; }
+    S.tr = null;
+    $("trainer").classList.add("hidden");
+  }
+  function addClips(n) {
+    const T = S.tr;
+    const used = new Set(T.clips);
+    let pool = S.segs.map((s, i) => i).filter((i) => !used.has(i) && S.segs[i].end - S.segs[i].start >= 2.5 && S.segs[i].end - S.segs[i].start <= 15);
+    if (pool.length < n) pool = S.segs.map((s, i) => i).filter((i) => !used.has(i) && S.segs[i].end - S.segs[i].start >= 1.2);
+    if (!pool.length) return;
+    // spread picks evenly across the recording, skipping neighbours of clips already chosen
+    const picks = [];
+    for (let k = 0; k < n && pool.length; k++) {
+      const target = (k + 0.5 + T.clips.length * 0.37) / n % 1;
+      let best = 0, bestD = Infinity;
+      pool.forEach((i, j) => { const d = Math.abs(i / S.segs.length - target); if (d < bestD) { bestD = d; best = j; } });
+      picks.push(pool.splice(best, 1)[0]);
+      pool = pool.filter((i) => Math.abs(i - picks[picks.length - 1]) > 2);
+    }
+    T.clips.push(...picks.sort((a, b) => a - b));
+  }
+  function personColor(T, id) { return SPK_COLORS[Math.max(0, T.people.findIndex((p) => p.id === id)) % SPK_COLORS.length]; }
+  function renderTrainer() {
+    const T = S.tr;
+    if (!T) return;
+    // people
+    const box = $("trPeople");
+    box.innerHTML = "";
+    T.people.forEach((p) => {
+      const chip = el("div", "tr-person");
+      const dot = el("i"); dot.style.background = personColor(T, p.id);
+      const input = el("input"); input.value = p.name; input.placeholder = "Name";
+      input.oninput = () => { p.name = input.value; renderTrainerClips(); renderTrainerCounts(); };
+      const rm = el("button", null, "✕"); rm.title = "Remove";
+      rm.onclick = () => {
+        if (T.people.length <= 2) { toast("You need at least two people"); return; }
+        T.people = T.people.filter((x) => x !== p);
+        for (const [k, v] of [...T.tags]) if (v === p.id) T.tags.delete(k);
+        renderTrainer();
+      };
+      chip.append(dot, input, rm);
+      box.append(chip);
+    });
+    const saved = $("trSaved");
+    saved.innerHTML = "";
+    if (S.voices.length) {
+      saved.append(document.createTextNode("Remembered voices:"));
+      for (const v of S.voices) {
+        const b = el("button", null, v.name);
+        b.title = "Use this remembered voice";
+        b.onclick = () => {
+          if (T.people.some((p) => p.name.trim().toLowerCase() === v.name.trim().toLowerCase())) return;
+          const generic = T.people.find((p) => /^speaker \d+$/i.test(p.name.trim()));
+          if (generic) generic.name = v.name;
+          else T.people.push({ id: newTrainerId(), name: v.name });
+          renderTrainer();
+        };
+        const x = el("button", "x", "✕");
+        x.title = `Forget ${v.name}'s voice`;
+        x.onclick = async () => {
+          if (!confirm(`Forget the saved voice "${v.name}"? Future files won't recognize it automatically.`)) return;
+          await api(`/api/voices/${v.id}`, { method: "DELETE" });
+          await loadVoices(); renderTrainer();
+        };
+        saved.append(b, x);
+      }
+    }
+    renderTrainerCounts();
+    renderTrainerClips();
+  }
+  function newTrainerId() {
+    const T = S.tr; let n = 1;
+    while (T.people.some((p) => p.id === "S" + n)) n++;
+    return "S" + n;
+  }
+  function renderTrainerCounts() {
+    const T = S.tr;
+    const c = $("trCounts");
+    c.innerHTML = "";
+    let ready = true;
+    for (const p of T.people) {
+      const n = [...T.tags.values()].filter((v) => v === p.id).length;
+      const ok = n >= 1 || hasVoice(p.name);
+      if (!ok) ready = false;
+      c.append(el("span", ok ? "ok" : "", `${p.name || "?"}: ${n}${hasVoice(p.name) ? " + saved voice" : ""}`));
+    }
+    const names = T.people.map((p) => p.name.trim().toLowerCase());
+    if (names.some((n) => !n) || new Set(names).size !== names.length) ready = false;
+    $("trApply").disabled = !ready;
+    $("trApply").title = ready ? "" : "Give everyone a unique name and tag at least one clip for each person";
+  }
+  function renderTrainerClips() {
+    const T = S.tr;
+    const list = $("trClips");
+    list.innerHTML = "";
+    for (const i of T.clips) {
+      const s = S.segs[i];
+      const tag = T.tags.get(i);
+      const li = el("li", "tr-clip" + (tag ? " tagged" : "") + (T.playing === i ? " playing" : ""));
+      if (tag) li.style.setProperty("--tag", personColor(T, tag));
+      li.dataset.i = i;
+      const play = el("button", "tr-play");
+      play.innerHTML = T.playing === i ? STOP_ICON : PLAY_ICON;
+      play.title = "Play this clip";
+      play.onclick = () => (T.playing === i ? (audio.pause(), (S.stopAt = null), trPlaying(null)) : playClip(i));
+      const body = el("div");
+      body.append(el("div", "tr-meta", `${fmt(s.start)} – ${fmt(s.end)}`), el("div", "tr-text", s.text || "(no text)"));
+      const tags = el("div", "tr-tags");
+      for (const p of T.people) {
+        const b = el("button", tag === p.id ? "on" : "");
+        b.style.setProperty("--tag", personColor(T, p.id));
+        const dot = el("i"); dot.style.background = personColor(T, p.id);
+        b.append(dot, document.createTextNode(p.name || "?"));
+        b.onclick = () => {
+          if (tag === p.id) T.tags.delete(i); else T.tags.set(i, p.id);
+          renderTrainerCounts(); renderTrainerClips();
+          if (T.tags.get(i)) playNextUntagged(i);
+        };
+        tags.append(b);
+      }
+      const skip = el("button", "skip", "Skip");
+      skip.title = "Overlapping voices, music or unsure";
+      skip.onclick = () => { T.tags.delete(i); T.clips = T.clips.filter((x) => x !== i); addClips(1); renderTrainerCounts(); renderTrainerClips(); playNextUntagged(i); };
+      tags.append(skip);
+      body.append(tags);
+      li.append(play, body);
+      list.append(li);
+    }
+  }
+  function playClip(i) {
+    const s = S.segs[i];
+    S.tr.playing = i;
+    S.stopAt = s.end + 0.15;
+    audio.currentTime = Math.max(0, s.start - 0.1);
+    audio.play().catch(() => {});
+    renderTrainerClips();
+    $("trClips").querySelector(`[data-i="${i}"]`)?.scrollIntoView({ block: "nearest", behavior: "smooth" });
+  }
+  function playNextUntagged(after) {
+    const T = S.tr;
+    const next = T.clips.find((i) => i > after && !T.tags.has(i)) ?? T.clips.find((i) => !T.tags.has(i));
+    if (next != null) playClip(next); else { audio.pause(); S.stopAt = null; trPlaying(null); }
+  }
+  function trPlaying(i) {
+    if (!S.tr || S.tr.playing === i) return;
+    S.tr.playing = i;
+    renderTrainerClips();
+  }
+  async function applyTrainer() {
+    const T = S.tr;
+    const speakers = {};
+    for (const p of T.people) speakers[p.id] = { name: p.name.trim() };
+    S.speakers = speakers;
+    S.segs.forEach((s) => { if (s.spk_locked && !speakers[s.speaker]) delete s.spk_locked; });
+    for (const [i, pid] of T.tags) {
+      const s = S.segs[i];
+      s.speaker = pid; s.spk_locked = true; s.spk_conf = 1;
+    }
+    const remember = $("trRemember").checked;
+    closeTrainer();
+    renderSegments(); renderSpeakers();
+    queueSave();
+    await runIdentify(remember);
+  }
+  $("teachBtn").onclick = openTrainer;
+  $("trClose").onclick = closeTrainer;
+  $("trainer").addEventListener("click", (e) => { if (e.target.id === "trainer") closeTrainer(); });
+  $("trAddPerson").onclick = () => {
+    if (S.tr.people.length >= 8) return;
+    const id = newTrainerId();
+    S.tr.people.push({ id, name: `Speaker ${id.slice(1)}` });
+    renderTrainer();
+  };
+  $("trMore").onclick = () => { addClips(6); renderTrainerClips(); };
+  $("trApply").onclick = applyTrainer;
+
   // ------------------------------------------------------------------ keyboard
   document.addEventListener("keydown", (e) => {
     const inField = e.target.closest("input, select, [contenteditable=true]");
-    if (e.key === "Escape") hideSpkMenu();
+    if (e.key === "Escape") { hideSpkMenu(); if (S.tr) closeTrainer(); }
     if ((e.ctrlKey || e.metaKey) && e.code === "Space") { e.preventDefault(); togglePlay(); return; }
     if (e.code === "Space" && !inField) { e.preventDefault(); togglePlay(); return; }
     if (e.altKey && !e.ctrlKey && !e.metaKey) {
@@ -1176,6 +1421,7 @@
   // ------------------------------------------------------------------ boot
   (async () => {
     await loadConfig();
+    loadVoices();
     await loadFiles();
     schedulePoll();
     const hash = location.hash.slice(1);

@@ -38,7 +38,11 @@ Confidence flags need per-word or per-token probabilities. Chat mode and whisper
 
 ### Speaker detection
 
-Diarization uses [sherpa-onnx](https://github.com/k2-fsa/sherpa-onnx) with the pyannote segmentation 3.0 model and NeMo TitaNet-small speaker embeddings (about 45 MB, baked into the image). It runs on the CPU at roughly 15× real time with 4 threads, so a 90-minute file takes about 6 minutes and runs at the same time as GPU transcription. Choose *Auto* or a fixed speaker count in the top bar. A fixed count is more reliable when you know it (for example 2 for an interview).
+Diarization uses [sherpa-onnx](https://github.com/k2-fsa/sherpa-onnx) with the pyannote segmentation 3.0 model and NeMo TitaNet-small speaker embeddings (about 45 MB, baked into the image). It runs on the CPU at roughly 15× real time with 4 threads, so a 90-minute file takes about 6 minutes and runs at the same time as GPU transcription. Choose *Auto* or a fixed speaker count in the top bar. A fixed count is more reliable when you know it (for example 2 for an interview). In *Auto*, clusters with the same voice are merged and tiny clusters are folded into the nearest voice, so noisy recordings don't explode into dozens of speakers.
+
+**Teach it who's who.** Click **Teach** in the Speakers panel, name the people in the file, play a few short clips and tag who's talking (2–3 per person is usually plenty). TranscribeR compares every line's voice fingerprint (TitaNet embedding) to your examples and relabels the whole file. Any line you later fix with the speaker menu counts as another example. Click **Update all from my corrections** to re-run. Lines where it can't tell are added to *Needs review*.
+
+**Remembered voices.** With *Remember these voices* on, each person's voice is saved to `/data/voices.json`. Future files are labeled with their names automatically, and a remembered person needs no tagged clips in Teach.
 
 ## Install on Unraid
 

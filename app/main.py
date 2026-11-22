@@ -167,18 +167,66 @@ def set_progress(fid: str, **values: Any) -> None:
     PROGRESS.setdefault(fid, {}).update(values)
 
 
-async def run_diarization(fid: str, audio: Path, num_speakers: int) -> list[tuple[float, float, int]]:
+VOICES_PATH = cfg.DATA_DIR / "voices.json"
+
+
+def load_voices() -> list[dict]:
+    return read_json(VOICES_PATH, {"voices": []}).get("voices", [])
+
+
+def save_voices(voices: list[dict]) -> None:
+    write_json(VOICES_PATH, {"voices": voices})
+
+
+def remember_voice(name: str, vec, count: int) -> dict:
+    """Create or refine a saved voice profile (running weighted average)."""
+    import numpy as np
+
+    voices = load_voices()
+    v = next((v for v in voices if v["name"].strip().lower() == name.strip().lower()), None)
+    if v:
+        old = np.array(v["emb"], dtype=np.float32) * min(v.get("n", 1), 60)
+        merged = old + vec * count
+        merged /= float(np.linalg.norm(merged)) or 1.0
+        v.update(emb=[round(float(x), 5) for x in merged], n=v.get("n", 1) + count, updated=time.time())
+    else:
+        v = {"id": uuid.uuid4().hex[:12], "name": name.strip()[:80], "n": count, "updated": time.time(),
+             "emb": [round(float(x), 5) for x in vec]}
+        voices.append(v)
+    save_voices(voices)
+    return v
+
+
+def name_from_voices(speakers: dict, centroids: dict) -> dict:
+    """Rename diarized speakers that match a saved voice; strips internal keys."""
+    voices = load_voices()
+    matched = diarize.match_voices(centroids, voices) if voices and centroids else {}
+    out = {}
+    for label, info in speakers.items():
+        v = matched.get(info.get("_idx"))
+        out[label] = {"name": v["name"], "voice": v["id"]} if v else {"name": info["name"]}
+    return out
+
+
+async def run_diarization(fid: str, audio: Path, num_speakers: int):
+    """Returns (turns, centroids, samples)."""
     loop = asyncio.get_running_loop()
     set_progress(fid, speakers=0.0)
 
     def progress(frac: float) -> None:
         loop.call_soon_threadsafe(lambda: set_progress(fid, speakers=round(frac, 3)))
 
+    def work():
+        samples = diarize.load_samples(audio)
+        turns = diarize.diarize(samples, num_speakers, progress)
+        cents = diarize.cluster_centroids(samples, turns) if load_voices() else {}
+        return turns, cents, samples
+
     t0 = time.time()
-    turns = await loop.run_in_executor(None, diarize.diarize, audio, num_speakers, progress)
+    turns, cents, samples = await loop.run_in_executor(None, work)
     log.info("speaker detection took %.1fs", time.time() - t0)
     set_progress(fid, speakers=1.0)
-    return turns
+    return turns, cents, samples
 
 
 async def job_transcribe(fid: str, opts: dict) -> None:
@@ -196,16 +244,16 @@ async def job_transcribe(fid: str, opts: dict) -> None:
         result = await asr.transcribe_file(audio, meta.get("duration") or 0, opts, d / "work",
                                            lambda p: set_progress(fid, **p))
         speakers: dict = {}
-        turns = None
+        turns, cents = None, {}
         if diar_task:
             set_progress(fid, stage="speakers")
             try:
-                turns = await diar_task
+                turns, cents, _ = await diar_task
             except Exception as exc:  # noqa: BLE001
                 log.exception("diarization failed for %s", fid)
         words = asr.finalize_words(result["spans"], result["silences"], turns)
         if turns:
-            speakers = asr.assign_speakers(words, turns)
+            speakers = name_from_voices(asr.assign_speakers(words, turns), cents)
         segments = asr.build_segments(words)
         asr.score_segments(segments)
         transcript = {"model": result["model"], "api": result["api"], "created": time.time(),
@@ -236,12 +284,12 @@ async def job_diarize(fid: str, opts: dict) -> None:
     PROGRESS[fid] = {"stage": "speakers"}
     try:
         n = diarize.parse_speakers(opts.get("speakers") or "auto") or -1
-        turns = await run_diarization(fid, d / "audio.mp3", n)
+        turns, cents, _ = await run_diarization(fid, d / "audio.mp3", n)
         t = read_json(d / "transcript.json")
         segs = t["segments"]
         # Assign per segment by majority overlap (keeps the user's segment edits intact).
         pseudo = [{"w": s["text"] + ".", "s": s["start"], "e": max(s["end"], s["start"] + 0.05)} for s in segs]
-        speakers = asr.assign_speakers(pseudo, turns)
+        speakers = name_from_voices(asr.assign_speakers(pseudo, turns), cents)
         # Carry user-given names over: each new speaker inherits the old speaker it overlaps most.
         old_names = {k: v.get("name") for k, v in (t.get("speakers") or {}).items()}
         overlap: dict[tuple[str, str], float] = {}
@@ -251,18 +299,61 @@ async def job_diarize(fid: str, opts: dict) -> None:
                 overlap[key] = overlap.get(key, 0.0) + (s["end"] - s["start"])
         used: set[str] = set()
         for (new, old), _ in sorted(overlap.items(), key=lambda kv: -kv[1]):
-            if new in speakers and old not in used and not speakers[new].get("_named") and old_names.get(old):
+            if (new in speakers and old not in used and not speakers[new].get("_named")
+                    and not speakers[new].get("voice") and old_names.get(old)):
                 speakers[new] = {"name": old_names[old], "_named": True}
                 used.add(old)
         speakers = {k: {"name": v["name"]} for k, v in speakers.items()}
         for s, p in zip(segs, pseudo):
             s["speaker"] = p.get("spk")
+            s.pop("spk_locked", None)
+            s.pop("spk_conf", None)
         t["speakers"] = speakers
         write_json(d / "transcript.json", t)
         update_meta(fid, status=prev_status, speaker_count=len(speakers))
     except Exception as exc:  # noqa: BLE001
         log.exception("diarization failed for %s", fid)
         update_meta(fid, status=prev_status, error=f"Speaker detection failed: {exc}")
+    finally:
+        PROGRESS.pop(fid, None)
+
+
+async def job_identify(fid: str, opts: dict) -> None:
+    """Re-label every segment by voice, learning from the segments the user tagged."""
+    d = fdir(fid)
+    update_meta(fid, status="diarizing", started_at=time.time(), error=None)
+    PROGRESS[fid] = {"stage": "voices", "label": "Matching voices to your examples"}
+    loop = asyncio.get_running_loop()
+
+    def progress(frac: float) -> None:
+        loop.call_soon_threadsafe(lambda: set_progress(fid, speakers=round(frac, 3)))
+
+    try:
+        t = read_json(d / "transcript.json")
+        cache = read_json(d / "embeddings.json", {})
+
+        def work():
+            samples = diarize.load_samples(d / "audio.mp3")
+            embs = diarize.segment_embeddings(samples, t["segments"], cache, progress)
+            stats = diarize.identify(t["segments"], embs, t.get("speakers") or {}, load_voices())
+            return embs, stats
+
+        embs, stats = await loop.run_in_executor(None, work)
+        write_json(d / "embeddings.json", cache)
+        if opts.get("remember"):
+            for sid, info in (t.get("speakers") or {}).items():
+                vec, n = diarize.voice_from_segments(t["segments"], embs, sid)
+                if vec is not None and not info.get("name", "").lower().startswith("speaker "):
+                    info["voice"] = remember_voice(info["name"], vec, min(n, 20))["id"]
+        write_json(d / "transcript.json", t)
+        log.info("voice identification for %s: %s", fid, stats)
+        update_meta(fid, status="done", speaker_count=len(t.get("speakers") or {}),
+                    last_identify={**stats, "at": time.time()})
+    except ValueError as exc:
+        update_meta(fid, status="done", error=str(exc))
+    except Exception as exc:  # noqa: BLE001
+        log.exception("identify failed for %s", fid)
+        update_meta(fid, status="done", error=f"Voice matching failed: {exc}")
     finally:
         PROGRESS.pop(fid, None)
 
@@ -279,6 +370,8 @@ async def worker() -> None:
             if (cfg.FILES_DIR / fid / "audio.mp3").exists():
                 if opts.get("job") == "diarize":
                     await job_diarize(fid, opts)
+                elif opts.get("job") == "identify":
+                    await job_identify(fid, opts)
                 else:
                     await job_transcribe(fid, opts)
             elif (cfg.FILES_DIR / fid / "meta.json").exists():
@@ -490,7 +583,7 @@ async def get_transcript(fid: str) -> dict:
 
 
 SEG_KEYS = {"id", "start", "end", "text", "speaker", "words", "reviewed", "edited",
-            "confidence", "issues", "low_words"}
+            "confidence", "issues", "low_words", "spk_locked", "spk_conf"}
 
 
 class TranscriptIn(BaseModel):
@@ -515,7 +608,9 @@ async def save_transcript(fid: str, body: TranscriptIn) -> dict:
             raise HTTPException(422, "Invalid segment") from None
     t["segments"] = sorted(segs, key=lambda s: s["start"])
     if body.speakers is not None:
-        t["speakers"] = {str(k): {"name": str((v or {}).get("name", k))[:80]} for k, v in body.speakers.items()}
+        t["speakers"] = {str(k): {"name": str((v or {}).get("name", k))[:80],
+                                  **({"voice": v["voice"]} if (v or {}).get("voice") else {})}
+                         for k, v in body.speakers.items()}
     t["updated"] = time.time()
     write_json(path, t)
     return {"ok": True, "updated": t["updated"]}
@@ -530,6 +625,59 @@ async def revert_transcript(fid: str) -> dict:
     write_json(d / "transcript.json", orig)
     orig.setdefault("speakers", {})
     return orig
+
+
+class IdentifyBody(BaseModel):
+    remember: bool = True
+
+
+@app.post("/api/files/{fid}/identify")
+async def start_identify(fid: str, body: IdentifyBody) -> dict:
+    meta = load_meta(fid)
+    if not diarize.available():
+        raise HTTPException(501, "Speaker models are not installed in this image")
+    if meta["status"] in ACTIVE_STATES:
+        raise HTTPException(409, f"File is already {meta['status']}")
+    t = read_json(fdir(fid) / "transcript.json")
+    if t is None or not (fdir(fid) / "audio.mp3").exists():
+        raise HTTPException(409, "Needs both audio and a transcript")
+    speakers = t.get("speakers") or {}
+    if len(speakers) < 2:
+        raise HTTPException(400, "Add at least two speakers first")
+    voices = {v["name"].strip().lower() for v in load_voices()}
+    tagged = {s.get("speaker") for s in t["segments"] if s.get("spk_locked")}
+    missing = [v["name"] for k, v in speakers.items() if k not in tagged and v["name"].strip().lower() not in voices]
+    if missing:
+        raise HTTPException(400, "Tag at least one clip for: " + ", ".join(missing))
+    await enqueue(fid, {"job": "identify", "remember": body.remember})
+    return public_meta(load_meta(fid))
+
+
+@app.get("/api/voices")
+async def list_voices() -> list[dict]:
+    return [{k: v[k] for k in ("id", "name", "n", "updated")} for v in load_voices()]
+
+
+class VoiceRename(BaseModel):
+    name: str
+
+
+@app.patch("/api/voices/{vid}")
+async def rename_voice(vid: str, body: VoiceRename) -> dict:
+    voices = load_voices()
+    v = next((v for v in voices if v["id"] == vid), None)
+    if not v:
+        raise HTTPException(404, "Voice not found")
+    v["name"] = body.name.strip()[:80] or v["name"]
+    save_voices(voices)
+    return {k: v[k] for k in ("id", "name", "n", "updated")}
+
+
+@app.delete("/api/voices/{vid}")
+async def delete_voice(vid: str) -> dict:
+    voices = load_voices()
+    save_voices([v for v in voices if v["id"] != vid])
+    return {"ok": True}
 
 
 # ---- exports -------------------------------------------------------------- #

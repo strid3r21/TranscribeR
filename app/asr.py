@@ -528,7 +528,8 @@ def assign_speakers(words: list[Word], turns: list[tuple[float, float, int]]) ->
                     for x in sent:
                         x["spk"] = top
             sent = []
-    return {label: {"name": f"Speaker {label[1:]}"} for label in order.values()}
+    # "_idx" maps back to the diarizer's cluster index (used for voice matching; stripped before saving)
+    return {label: {"name": f"Speaker {label[1:]}", "_idx": spk} for spk, label in order.items()}
 
 
 def build_segments(words: list[Word], max_words: int = 40) -> list[dict]:
