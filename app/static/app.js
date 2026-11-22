@@ -67,12 +67,17 @@
     return b.toFixed(i ? 1 : 0) + " " + u[i];
   }
   let toastTimer;
-  function toast(msg, isError = false) {
+  function toast(msg, isError = false, action = null) {
     const t = $("toast");
     t.textContent = msg;
-    t.className = "toast show" + (isError ? " error" : "");
+    t.className = "toast show" + (isError ? " error" : "") + (action ? " has-action" : "");
+    if (action) {
+      const b = el("button", "toast-action", action.label);
+      b.onclick = () => { t.className = "toast"; action.fn(); };
+      t.append(b);
+    }
     clearTimeout(toastTimer);
-    toastTimer = setTimeout(() => (t.className = "toast"), isError ? 6000 : 2600);
+    toastTimer = setTimeout(() => (t.className = "toast"), isError ? 6000 : action ? 8000 : 2600);
   }
   async function api(path, opts = {}) {
     const res = await fetch(path, {
@@ -676,8 +681,8 @@
         const live = rid && S.transcript?.redactions?.[rid];
         const bar = el("span", "redacted" + (live ? "" : " final"), m[0]);
         bar.contentEditable = "false";
-        if (live) { bar.dataset.rid = rid; bar.title = "Redacted · click to unredact or erase"; }
-        else bar.title = "Permanently redacted";
+        if (live) { bar.dataset.rid = rid; bar.title = "Redacted · click to unredact (right-click for more)"; }
+        else bar.title = "Permanently redacted · click to recover the words from the audio";
         frag.append(bar);
         pos = m.index + m[0].length;
       }
@@ -1414,38 +1419,76 @@
     return { i: +a.parentElement.dataset.i, phrase, offset: pre.toString().length };
   }
   // ---- clicking a redaction bar: unredact / erase
-  let redTarget = null;
+  let redTarget = null, redSeg = null, redBar = 0;
   function hideRedMenu() { $("redMenu").classList.add("hidden"); redTarget = null; }
-  segBox.addEventListener("mousedown", (e) => {
-    const bar = e.target.closest(".redacted[data-rid]");
-    if (!bar) return;
-    e.preventDefault(); // don't start editing / selecting
+  function showRedMenu(bar) {
     hideBubble(); hideCtx();
-    redTarget = bar.dataset.rid;
-    const info = S.transcript?.redactions?.[redTarget] || {};
-    $("redInfo").textContent = info.muted ? "Redacted text · audio muted" : "Redacted text";
+    redTarget = bar.dataset.rid || null;
+    redSeg = +bar.closest(".seg").dataset.i;
+    redBar = [...bar.closest(".seg-text").querySelectorAll(".redacted.final")].indexOf(bar);
+    const info = (redTarget && S.transcript?.redactions?.[redTarget]) || {};
+    $("redInfo").textContent = redTarget ? (info.muted ? "Redacted text · audio muted" : "Redacted text")
+      : "This was redacted permanently, so the words aren't stored anywhere";
     $("redUndoSub").textContent = info.muted ? "Restore the original text and audio" : "Restore the original text";
+    $("redUndo").classList.toggle("hidden", !redTarget);
+    $("redErase").classList.toggle("hidden", !redTarget);
+    $("redRecover").classList.toggle("hidden", !!redTarget);
+    $("redRecover").disabled = !S.current?.has_audio;
     const m = $("redMenu");
     m.classList.remove("hidden");
     const r = bar.getBoundingClientRect(), mw = m.offsetWidth, mh = m.offsetHeight;
     m.style.left = Math.max(8, Math.min(r.left, innerWidth - mw - 8)) + "px";
     m.style.top = (r.bottom + mh + 8 > innerHeight ? r.top - mh - 6 : r.bottom + 6) + "px";
+  }
+  segBox.addEventListener("mousedown", (e) => {
+    const bar = e.target.closest(".redacted");
+    if (!bar || e.button !== 0) return;
+    e.preventDefault(); // don't start editing / selecting
+    if (bar.dataset.rid) { hideRedMenu(); unredact(bar.dataset.rid); } // one click = unredact
+    else showRedMenu(bar);
   });
-  document.addEventListener("mousedown", (e) => { if (!e.target.closest("#redMenu") && !e.target.closest(".redacted[data-rid]")) hideRedMenu(); });
+  segBox.addEventListener("contextmenu", (e) => {
+    const bar = e.target.closest(".redacted");
+    if (!bar) return;
+    e.preventDefault(); e.stopImmediatePropagation();
+    showRedMenu(bar);
+  }, true);
+  document.addEventListener("mousedown", (e) => { if (!e.target.closest("#redMenu") && !e.target.closest(".redacted")) hideRedMenu(); });
+  async function unredact(rid) {
+    await redactionAction(`redactions/${rid}/unredact`, null, (r) => {
+      toast(r.unmuted ? "Unredacted (text and audio restored)" : "Unredacted", false, r.segment_id != null ? {
+        label: "Redact again",
+        fn: () => {
+          const i = S.segs.findIndex((s) => s.id === r.segment_id);
+          if (i >= 0) doRedact({ i, phrase: r.text, offset: r.offset }, false, r.was_muted, true);
+        },
+      } : null);
+    });
+  }
   document.addEventListener("wheel", hideRedMenu, { passive: true });
-  async function redactionAction(path, okMsg) {
+  async function redactionAction(path, okMsg, after) {
     try {
       queueSave(); await flushSave();
       const r = await api(`/api/files/${S.current.id}/${path}`, { method: "POST" });
       S.transcript = r.transcript; S.segs = r.transcript.segments; S.speakers = r.transcript.speakers || {}; S.markers = r.transcript.markers || S.markers;
       renderSegments(); renderSpeakers();
-      toast(okMsg(r));
+      if (okMsg) toast(okMsg(r));
+      if (after) after(r);
       if (r.unmuted) { const t = audio.currentTime; await loadFiles(); await loadAudio(); audio.currentTime = t; }
     } catch (e) { toast(e.message, true); }
   }
-  $("redUndo").onclick = () => {
-    const rid = redTarget; hideRedMenu();
-    if (rid) redactionAction(`redactions/${rid}/unredact`, (r) => r.unmuted ? "Unredacted (text and audio restored)" : "Unredacted");
+  $("redUndo").onclick = () => { const rid = redTarget; hideRedMenu(); if (rid) unredact(rid); };
+  $("redRecover").onclick = async () => {
+    const seg = S.segs[redSeg], bar = redBar; hideRedMenu();
+    if (!seg) return;
+    toast("Listening to the audio again…");
+    try {
+      queueSave(); await flushSave();
+      const r = await api(`/api/files/${S.current.id}/segments/${seg.id}/recover`, { method: "POST", body: JSON.stringify({ bar }) });
+      S.transcript = r.transcript; S.segs = r.transcript.segments; S.speakers = r.transcript.speakers || {}; S.markers = r.transcript.markers || S.markers;
+      renderSegments(); renderSpeakers();
+      toast("Words recovered from the audio. Check them, and redact again if needed");
+    } catch (e) { toast(e.message, true); }
   };
   $("redErase").onclick = () => {
     const rid = redTarget; hideRedMenu();
@@ -1521,7 +1564,7 @@
     if (!t) { toast("Select the text you want to redact first"); return; }
     doRedact(t, everywhere, mute);
   }
-  async function doRedact(target, everywhere, mute) {
+  async function doRedact(target, everywhere, mute, quiet = false) {
     if (!target || !S.current) return;
     const seg = S.segs[target.i];
     if (!seg) return;
@@ -1529,7 +1572,7 @@
       const n = countEverywhere(target.phrase);
       if (!confirm(`Redact all ${n} occurrences of "${target.phrase}"? This can't be undone.`)) return;
     }
-    if (mute && !confirm("Also silence this part of the audio? The recording is changed permanently.")) return;
+    if (mute && !quiet && !confirm("Also silence this part of the audio? You can unredact later to bring it back.")) return;
     // capture any in-progress edit of this line before redacting on the server
     const txt = rowEl(target.i)?.querySelector(".seg-text");
     if (txt && document.activeElement === txt) seg.text = txt.textContent.replace(/\n/g, " ");

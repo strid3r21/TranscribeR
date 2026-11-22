@@ -210,3 +210,50 @@ def mute_filter(spans: list, pad: float = 0.25) -> Optional[str]:
             merged.append([a, b])
     expr = "+".join(f"between(t,{a:.3f},{b:.3f})" for a, b in merged)
     return f"volume=enable='{expr}':volume=0"
+
+
+def _key(tok: str) -> str:
+    return re.sub(r"[^\w']", "", tok.lower())
+
+
+def fill_bar(text: str, bar_index: int, recovered: str) -> Optional[str]:
+    """Replace the bar_index-th permanent [REDACTED] in `text` with the matching words from `recovered`.
+
+    The recovered transcript (of a wider window) is aligned word-by-word against the current line;
+    the words aligned to the bar's position fill it. The rest of the line is left untouched.
+    """
+    from difflib import SequenceMatcher
+
+    toks = text.split()
+    bars = [i for i, t in enumerate(toks) if REDACTED in t and not TOKEN_RE.search(t.replace(REDACTED, ""))]
+    if bar_index >= len(bars):
+        return None
+    b = bars[bar_index]
+    rec = recovered.split()
+    cur_keys = [("\x00bar" if i == b else _key(t)) for i, t in enumerate(toks)]
+    rec_keys = [_key(t) for t in rec]
+    ops = SequenceMatcher(None, cur_keys, rec_keys, autojunk=False).get_opcodes()
+    for tag, i1, i2, j1, j2 in ops:
+        if i1 <= b < i2 and tag in ("replace", "delete"):
+            if j2 <= j1:
+                return None
+            words = rec[j1:j2]
+            ends = re.compile(r"[.!?…][\"'”’)\]]*$")
+            if i2 == len(toks):  # bar ends the line: stop at the end of the first sentence heard
+                cut = next((k for k, w in enumerate(words) if ends.search(w)), None)
+                if cut is not None:
+                    words = words[: cut + 1]
+            if i1 == 0:  # bar starts the line: drop the tail of the previous sentence
+                cut = max((k for k, w in enumerate(words[:-1]) if ends.search(w)), default=None)
+                if cut is not None:
+                    words = words[cut + 1:]
+            if not words:
+                return None
+            lead = toks[i1][: toks[i1].find(REDACTED)] if i1 == b else ""
+            last = toks[i2 - 1]
+            trail = last[last.find(REDACTED) + len(REDACTED):] if i2 - 1 == b else ""
+            words[0] = lead + words[0].lstrip(_LEAD) if lead else words[0]
+            if trail:
+                words[-1] = words[-1].rstrip(_TRAIL) + trail
+            return " ".join(toks[:i1] + words + toks[i2:])
+    return None

@@ -767,13 +767,59 @@ async def unredact_text(fid: str, rid: str) -> dict:
     entry = store["entries"].get(rid)
     if entry is None:
         raise HTTPException(404, "This redaction was erased permanently and can't be undone")
+    seg = next((s for s in t["segments"] if redact.token(rid) in (s.get("text") or "")), None)
+    offset = seg["text"].index(redact.token(rid)) if seg else None
     redact.unredact(t["segments"], rid, entry["text"])
     del store["entries"][rid]
     t["updated"] = time.time()
     write_json(d / "transcript.json", t)
     save_redactions(d, store)
     unmuted = await rebuild_audio(fid, d, store) if entry.get("muted") else False
-    return {"unmuted": unmuted, "transcript": with_redactions(d, t)}
+    return {"unmuted": unmuted, "text": entry["text"], "segment_id": seg["id"] if seg else None,
+            "offset": offset, "was_muted": bool(entry.get("muted")), "transcript": with_redactions(d, t)}
+
+
+class RecoverBody(BaseModel):
+    bar: int = 0  # which permanent bar in the line (0 = first)
+
+
+@app.post("/api/files/{fid}/segments/{sid}/recover")
+async def recover_bar(fid: str, sid: int, body: RecoverBody) -> dict:
+    """Recover the words behind a permanent [REDACTED] bar by re-transcribing the audio around it."""
+    d, t = _editable(fid)
+    seg = next((s for s in t["segments"] if s["id"] == sid), None)
+    if seg is None:
+        raise HTTPException(404, "Line not found")
+    if not (d / "audio.mp3").exists():
+        raise HTTPException(409, "The audio for this file was deleted, so the words can't be recovered")
+    meta = load_meta(fid)
+    model = meta.get("model") or cfg.DEFAULT_MODEL
+    # Line times are partly estimated, so listen to a generous window around it.
+    start = max(0.0, seg["start"] - 3.0)
+    end = min(float(meta.get("duration") or seg["end"] + 3.0), seg["end"] + 3.0)
+    work = d / "work"
+    work.mkdir(exist_ok=True)
+    tr = asr.Transcriber(model, await asr.resolve_api(model), cfg.DEFAULT_LANGUAGE or None, None)
+    try:
+        path = await asr.extract_chunk(d / "audio.mp3", start, end, work, f"recover{sid}")
+        words, _ = await tr.transcribe(path, start, end, [])
+    except Exception as exc:  # noqa: BLE001
+        raise HTTPException(502, f"Couldn't re-transcribe the audio: {exc}") from None
+    finally:
+        await tr.close()
+        shutil.rmtree(work, ignore_errors=True)
+    heard = "".join(w["w"] for w in words).strip()
+    new_text = redact.fill_bar(seg["text"], body.bar, heard) if heard else None
+    if not new_text:
+        raise HTTPException(422, "Couldn't find the missing words in the audio (was this part muted?)")
+    old_words = seg.get("words") or []
+    seg["text"] = new_text
+    if not (old_words and redact._norm("".join(w["w"] for w in old_words)) == redact._norm(new_text)):
+        seg["words"] = []  # timings are re-estimated in the browser for this line
+    seg["edited"] = True
+    t["updated"] = time.time()
+    write_json(d / "transcript.json", t)
+    return {"text": new_text, "transcript": with_redactions(d, t)}
 
 
 async def _erase(fid: str, d: Path, t: dict, store: dict, rid: str) -> None:
