@@ -46,3 +46,8 @@ MOSS_THREADS = int(os.getenv("MOSS_THREADS", "0"))  # 0 = all cores
 MOSS_CHUNK_SECONDS = float(os.getenv("MOSS_CHUNK_SECONDS", "600"))
 MOSS_REMOTE_MATCH = os.getenv("MOSS_REMOTE_MATCH", "moss")  # llama-swap model names treated as MOSS (regex)
 MOSS_REMOTE_CHUNK_SECONDS = float(os.getenv("MOSS_REMOTE_CHUNK_SECONDS", "600"))
+
+# Accounts: set both to require sign-in. This admin is created/updated from these values on start.
+ADMIN_USERNAME = os.getenv("ADMIN_USERNAME", "").strip()
+ADMIN_PASSWORD = os.getenv("ADMIN_PASSWORD", "")
+SESSION_SECRET = os.getenv("SESSION_SECRET", "")  # optional; otherwise a random key in /data/secret.key

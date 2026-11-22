@@ -283,6 +283,7 @@ def identify(segs: list[dict], embs: list, speakers: dict, voices: list[dict]) -
     changed = unsure = 0
     for s, e in zip(segs, embs):
         s["issues"] = [x for x in (s.get("issues") or []) if not x.startswith("Not sure who")]
+        s.pop("spk_changed", None)
         if s.get("spk_locked") and s.get("speaker") in cents:
             s["spk_conf"] = 1.0
             continue
@@ -295,6 +296,7 @@ def identify(segs: list[dict], embs: list, speakers: dict, voices: list[dict]) -
         margin = float(sims[order[0]] - sims[order[1]]) if len(ids) > 1 else float(sims[order[0]])
         if s.get("speaker") != best:
             changed += 1
+            s["spk_changed"] = True  # highlighted in the UI until the next edit
         s["speaker"] = best
         s["spk_conf"] = round(margin, 3)
 

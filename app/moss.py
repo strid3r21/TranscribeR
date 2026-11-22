@@ -155,6 +155,14 @@ TRUNCATED_NOTE = "The model stopped early here; some words may be missing"
 MARKER_RE = re.compile(r"\[(\d+(?:\.\d+)?)\]\s*\[S(\d+)\]\s*(.*?)\s*\[(\d+(?:\.\d+)?)\]", re.S)
 
 
+LEFTOVER_RE = re.compile(r"\s*\[(?:\d+(?:\.\d+)?|S\d+)\]\s*")
+
+
+def clean_text(text: str) -> str:
+    """Strip turn markers MOSS sometimes leaves inside the text, e.g. 'on Etsy.[600.81]'."""
+    return re.sub(r"\s{2,}", " ", LEFTOVER_RE.sub(" ", text or "")).strip()
+
+
 class ChunkTooBig(Exception):
     pass
 
@@ -237,7 +245,7 @@ class _Local:
                 segs, note = (part.segments if part else ()), TRUNCATED_NOTE
             finally:
                 _LIVE.discard(s)
-        return [(sg.t0_ms / 1000.0, sg.t1_ms / 1000.0, max(0, sg.speaker_id), sg.text.strip()) for sg in segs], note
+        return [(sg.t0_ms / 1000.0, sg.t1_ms / 1000.0, max(0, sg.speaker_id), clean_text(sg.text)) for sg in segs], note
 
     async def start(self) -> None:
         await _lock_async()
@@ -322,14 +330,14 @@ class _Remote:
                 spk = str(sg.get("speaker") or "0")
                 m = re.search(r"\d+", spk)
                 out.append((float(sg.get("start") or 0), float(sg.get("end") or 0), int(m.group()) if m else 0,
-                            (sg.get("text") or "").strip()))
+                            clean_text(sg.get("text") or "")))
             return out, note
         text = body.get("raw_text") or body.get("text") or ""
         turns = parse_markers(text)
         if turns:
             return turns, note
         if segs:  # plain segments without speakers
-            return [(float(sg.get("start") or 0), float(sg.get("end") or 0), 0, (sg.get("text") or "").strip())
+            return [(float(sg.get("start") or 0), float(sg.get("end") or 0), 0, clean_text(sg.get("text") or ""))
                     for sg in segs], note
         return ([(0.0, 0.0, 0, text.strip())] if text.strip() else []), note
 
@@ -380,7 +388,7 @@ async def transcribe_file(audio: Path, duration: float, opts: dict, work_dir: Pa
     chunks = asr.plan_chunks(duration, silences, target)
     want_speakers = num_speakers is not None
     ropts = {"speakers": want_speakers, "language": _language(opts),
-             "vocabulary": [v.strip() for v in re.split(r"[,\n]", opts.get("prompt") or "") if v.strip()] or None}
+             "vocabulary": asr.vocabulary_list(opts) or None}
     loop = asyncio.get_running_loop()
     log.info("transcribing %s (%.0fs) with %s (MOSS) in %d chunks", audio, duration, model, len(chunks))
     work_dir.mkdir(parents=True, exist_ok=True)

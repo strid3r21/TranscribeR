@@ -236,9 +236,11 @@ def _check_error(r: httpx.Response) -> None:
 class Transcriber:
     """Sends audio chunks to llama-swap and returns timed words."""
 
-    def __init__(self, model: str, api: str, language: Optional[str], prompt: Optional[str]):
+    def __init__(self, model: str, api: str, language: Optional[str], prompt: Optional[str],
+                 vocabulary: Optional[list[str]] = None):
         self.model, self.api = model, api
         self.language, self.prompt = language, prompt
+        self.vocabulary = vocabulary or []
         self.formats = ["verbose_json+words", "verbose_json", "json"]
         self.client = httpx.AsyncClient(timeout=httpx.Timeout(cfg.REQUEST_TIMEOUT, connect=30))
 
@@ -281,8 +283,8 @@ class Transcriber:
                 data["timestamp_granularities[]"] = ["segment", "word"]
             if self.language:
                 data["language"] = self.language
-            if self.prompt:
-                data["prompt"] = self.prompt
+            if self.prompt or self.vocabulary:  # whisper-style initial prompt: terms steer the spelling
+                data["prompt"] = " ".join(filter(None, [self.prompt, ", ".join(self.vocabulary)]))
             with path.open("rb") as fh:
                 r = await self.client.post(f"{cfg.LLAMA_SWAP_URL}/v1/audio/transcriptions", data=data,
                                            files={"file": (path.name, fh, mime)}, headers=headers())
@@ -308,6 +310,9 @@ class Transcriber:
             "data": base64.b64encode(path.read_bytes()).decode(),
             "format": "wav" if path.suffix == ".wav" else "mp3"}}]
         instruction = self.prompt or cfg.CHAT_PROMPT
+        if self.vocabulary:
+            instruction = (instruction + " " if instruction else "") + \
+                "These names and terms may occur; spell them exactly like this: " + ", ".join(self.vocabulary) + "."
         if instruction:
             content.append({"type": "text", "text": instruction})
         body = {"model": self.model, "messages": [{"role": "user", "content": content}],
@@ -396,6 +401,12 @@ def words_from_transcription(raw: Any, start: float, end: float,
 # --------------------------------------------------------------------------- #
 
 
+def vocabulary_list(opts: dict) -> list[str]:
+    """Custom words/names from the transcribe dialog: comma or newline separated."""
+    raw = opts.get("vocabulary") or ""
+    return [v.strip() for v in re.split(r"[,\n;]", raw) if v.strip()][:100]
+
+
 async def extract_chunk(audio: Path, start: float, end: float, dest_dir: Path, name: str) -> Path:
     wav = cfg.UPSTREAM_FORMAT == "wav"
     dest = dest_dir / f"chunk_{name}.{'wav' if wav else 'mp3'}"
@@ -416,7 +427,8 @@ async def transcribe_file(audio: Path, duration: float, opts: dict, work_dir: Pa
     chunks = plan_chunks(duration, silences, float(opts.get("chunk_seconds") or cfg.CHUNK_SECONDS))
     log.info("transcribing %s (%.0fs) with %s via %s in %d chunks", audio, duration, model, api, len(chunks))
 
-    tr = Transcriber(model, api, opts.get("language") or cfg.DEFAULT_LANGUAGE or None, opts.get("prompt"))
+    tr = Transcriber(model, api, opts.get("language") or cfg.DEFAULT_LANGUAGE or None, opts.get("prompt"),
+                     vocabulary_list(opts))
     results: list[Optional[list[tuple]]] = [None] * len(chunks)
     done = 0
     t0 = time.time()

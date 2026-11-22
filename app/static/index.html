@@ -48,6 +48,14 @@
         <input type="checkbox" id="autoToggle"><span class="switch"></span><span>Auto-transcribe</span>
       </label>
       <div class="backend" id="backendStatus" title="llama-swap connection"><span class="dot"></span><span class="label">Connecting…</span></div>
+      <div class="menu hidden" id="acctWrap">
+        <button class="btn sm acct-btn" id="acctBtn"><span class="acct-avatar" id="acctAvatar"></span><span id="acctName"></span> ▾</button>
+        <div class="menu-pop right" id="acctMenu">
+          <a href="admin.html" id="adminLink" class="hidden"><b>Admin</b><small>Users and model benchmarks</small></a>
+          <button id="pwBtn"><b>Change password</b><small>Signs out your other sessions</small></button>
+          <button id="logoutBtn"><b>Sign out</b></button>
+        </div>
+      </div>
     </div>
   </header>
 
@@ -110,15 +118,25 @@
               <div class="menu-pop" id="downloadMenu">
                 <button data-fmt="txt"><b>Plain text</b><small>.txt with no timestamps</small></button>
                 <button data-fmt="timestamps"><b>With timestamps</b><small>[00:01:23 - 00:01:27] text</small></button>
+                <button data-fmt="docx"><b>Word document</b><small>.docx, speaker paragraphs</small></button>
+                <button data-fmt="md"><b>Markdown</b><small>.md, speaker paragraphs with times</small></button>
                 <button data-fmt="srt"><b>SRT subtitles</b><small>.srt</small></button>
                 <button data-fmt="vtt"><b>WebVTT</b><small>.vtt</small></button>
                 <button data-fmt="chapters"><b>Chapters</b><small>marker list, e.g. for podcast show notes</small></button>
                 <button data-fmt="json"><b>JSON</b><small>segments + confidence + markers</small></button>
               </div>
             </div>
+            <div class="menu hidden" id="versionsWrap">
+              <button class="btn" id="versionsBtn" title="Transcripts of this file from earlier runs or other models">Versions ▾</button>
+              <div class="menu-pop right versions-pop" id="versionsMenu"></div>
+            </div>
             <div class="menu">
               <button class="btn icon" id="moreBtn" title="More">⋯</button>
               <div class="menu-pop right" id="moreMenu">
+                <button id="findBtn"><b>Find &amp; replace</b><small>Fix a name or word everywhere (Ctrl+H)</small></button>
+                <button id="copyTextBtn"><b>Copy transcript</b><small>Plain text with speaker names, to paste anywhere</small></button>
+                <button id="renameBtn"><b>Rename</b><small>Or click the title</small></button>
+                <button id="copyFileBtn"><b>Make a copy</b><small>Duplicate the audio, transcript and versions</small></button>
                 <button id="diarizeBtn"><b>Detect speakers again</b><small>Keeps your text edits; uses the Speakers setting</small></button>
                 <button id="revertBtn"><b>Revert edits</b><small>Restore the original model output (redactions stay)</small></button>
                 <button id="eraseAllBtn"><b>Erase all redactions permanently</b><small>Do this before sharing. Redactions can't be undone after</small></button>
@@ -298,16 +316,51 @@
           <select id="wzModel"></select>
           <p class="muted tr-hint wz-hint" id="wzModelHint"></p>
         </section>
+        <details class="wz-more" id="wzMore">
+          <summary>More options <small id="wzMoreSummary"></small></summary>
+          <label class="form-row"><span>Language</span><input id="wzLang" list="languages" placeholder="auto detect"></label>
+          <label class="form-row"><span>Names and special terms <small class="muted">helps the model spell them right, comma separated</small></span>
+            <textarea id="wzVocab" rows="2" placeholder="e.g. Leah, Kubernetes, Tacoma, Dr. Okafor"></textarea></label>
+        </details>
+        <label class="toggle hidden" id="wzKeepWrap"><input type="checkbox" id="wzKeep" checked><span class="switch"></span><span>Keep the current transcript as a version</span></label>
         <label class="toggle"><input type="checkbox" id="wzTeach" checked><span class="switch"></span><span>When it's done, help me tag who's who</span></label>
       </div>
       <div class="modal-foot">
-        <label class="toggle"><input type="checkbox" id="wzAlways" checked><span class="switch"></span><span>Ask every time I upload</span></label>
+        <label class="toggle" id="wzAlwaysWrap"><input type="checkbox" id="wzAlways" checked><span class="switch"></span><span>Ask every time I upload</span></label>
         <div class="wz-actions">
           <button class="btn" id="wzLater">Not now</button>
           <button class="btn primary" id="wzStart">Start transcription</button>
         </div>
       </div>
     </div>
+  </div>
+  <div class="modal hidden" id="findModal" role="dialog" aria-modal="true" aria-labelledby="frTitle">
+    <div class="modal-card small-card">
+      <div class="modal-head"><h3 id="frTitle">Find &amp; replace</h3><button class="btn icon sm" id="frClose" title="Close">✕</button></div>
+      <div class="modal-body">
+        <label class="form-row"><span>Find</span><input id="frFind" autocomplete="off"></label>
+        <label class="form-row"><span>Replace with</span><input id="frReplace" autocomplete="off"></label>
+        <div class="fr-opts">
+          <label class="toggle"><input type="checkbox" id="frCase"><span class="switch"></span><span>Match case</span></label>
+          <label class="toggle"><input type="checkbox" id="frWord" checked><span class="switch"></span><span>Whole words</span></label>
+        </div>
+        <div class="muted fr-count" id="frCount"></div>
+        <ul class="fr-preview" id="frPreview"></ul>
+      </div>
+      <div class="modal-foot"><span class="muted fr-hint">Redacted text is never changed.</span><button class="btn primary" id="frApply" disabled>Replace all</button></div>
+    </div>
+  </div>
+  <div class="modal hidden" id="pwModal" role="dialog" aria-modal="true" aria-labelledby="pwTitle">
+    <form class="modal-card small-card" id="pwForm">
+      <div class="modal-head"><h3 id="pwTitle">Change password</h3><button type="button" class="btn icon sm" id="pwClose" title="Close">✕</button></div>
+      <div class="modal-body">
+        <label class="form-row"><span>Current password</span><input type="password" id="pwCurrent" autocomplete="current-password" required></label>
+        <label class="form-row"><span>New password <small class="muted">at least 8 characters</small></span><input type="password" id="pwNew" autocomplete="new-password" minlength="8" required></label>
+        <label class="form-row"><span>Repeat new password</span><input type="password" id="pwNew2" autocomplete="new-password" minlength="8" required></label>
+        <div class="login-error" id="pwError"></div>
+      </div>
+      <div class="modal-foot"><span></span><button class="btn primary" type="submit">Change password</button></div>
+    </form>
   </div>
   <div class="toast" id="toast"></div>
   <script src="app.js"></script>

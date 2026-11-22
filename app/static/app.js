@@ -84,6 +84,10 @@
       ...opts,
       headers: opts.body && !(opts.body instanceof FormData) ? { "Content-Type": "application/json" } : undefined,
     });
+    if (res.status === 401) {
+      location.href = "/login.html?next=" + encodeURIComponent(location.pathname + location.hash);
+      throw new Error("Please sign in");
+    }
     if (!res.ok) {
       let msg = res.statusText;
       try { const j = await res.json(); msg = j.detail || msg; } catch { /* ignore */ }
@@ -380,6 +384,7 @@
       S.markers = S.transcript.markers || [];
     } catch { S.transcript = null; S.segs = []; S.speakers = {}; S.markers = []; }
     renderHeader(); renderSegments(); renderSpeakers(); renderMarkers();
+    loadVersions();
   }
 
   // ------------------------------------------------------------------ header & progress
@@ -463,19 +468,7 @@
     catch (err) { toast(err.message, true); }
   });
 
-  $("transcribeBtn").onclick = async () => {
-    const f = S.current;
-    if (!f) return;
-    if (f.has_transcript && !confirm("Re-transcribe this file? Your current transcript and any edits will be replaced. Undoable redactions are re-applied; permanently erased text may reappear unless its audio was muted.")) return;
-    try {
-      await flushSave();
-      S.current = await api(`/api/files/${f.id}/transcribe`, { method: "POST", body: JSON.stringify(transcribeOpts()) });
-      S.current.has_transcript = false;
-      S.transcript = null; S.segs = []; S.speakers = {};
-      renderHeader(); renderSegments(); renderSpeakers();
-      await loadFiles(); schedulePoll();
-    } catch (e) { toast(e.message, true); }
-  };
+  $("transcribeBtn").onclick = () => openReprocess();
 
   $("stopBtn").onclick = async () => {
     const f = S.current;
@@ -577,11 +570,36 @@
     foot.innerHTML = "";
     const tagged = S.segs.filter((s) => s.spk_locked).length;
     const unsure = S.segs.filter((s) => (s.issues || []).some((x) => x.startsWith("Not sure who"))).length;
-    if (tagged && ids.length >= 2 && S.current?.has_audio && S.config?.diarization_available) {
+    const last = S.current?.last_identify;
+    const upToDate = last && last.sig && last.sig === correctionsSig();
+    const missing = ids.filter((id) => !S.segs.some((x) => x.spk_locked && x.speaker === id) && !hasVoice(spkName(id)));
+    if (tagged && ids.length >= 2 && S.current?.has_audio && S.config?.diarization_available && !upToDate && missing.length) {
+      foot.append(el("small", "id-need", `To re-label the whole file by voice, also tag at least one line for ${missing.map(spkName).join(", ")} (click a speaker chip, or use Teach).`));
+    }
+    if (tagged && ids.length >= 2 && S.current?.has_audio && S.config?.diarization_available && !upToDate && !missing.length) {
       const b = el("button", "btn sm primary", `Update all from my corrections (${tagged})`);
       b.title = "Re-label every line by voice, using the lines you've tagged or corrected as examples";
       b.onclick = () => runIdentify(true);
       foot.append(b);
+      foot.append(el("small", null, `Uses the ${tagged} line${tagged > 1 ? "s" : ""} you tagged or fixed as voice examples, re-labels every other line by voice, and remembers the voices for future files.`));
+    }
+    if (last && last.at) {
+      const ago = Math.max(0, Date.now() / 1000 - last.at);
+      const when = ago < 90 ? "just now" : ago < 3600 ? `${Math.round(ago / 60)} min ago` : new Date(last.at * 1000).toLocaleString([], { month: "short", day: "numeric", hour: "numeric", minute: "2-digit" });
+      const box = el("div", "id-summary" + (upToDate ? " ok" : ""));
+      box.append(el("b", null, upToDate ? "✓ Up to date with your corrections" : "Last voice update"));
+      box.append(el("span", null, `${when[0].toUpperCase() + when.slice(1)}` + (last.examples ? `, from ${last.examples} example${last.examples > 1 ? "s" : ""}` : "") +
+        `: ${last.changed ? `${last.changed} line${last.changed > 1 ? "s" : ""} relabeled (marked ↻)` : "every line already matched, nothing changed"}` +
+        (last.unsure ? `, ${last.unsure} unclear (in Needs review)` : "") + "."));
+      const marked = S.segs.filter((x) => x.spk_changed).length;
+      if (marked) {
+        const nav = el("button", "linklike", `Show relabeled lines (${marked})`);
+        nav.onclick = () => { const k = S.segs.findIndex((x, j) => x.spk_changed && j > S.relabelCursor) ; const j = k >= 0 ? k : S.segs.findIndex((x) => x.spk_changed); S.relabelCursor = j; rowEl(j)?.scrollIntoView({ block: "center" }); rowEl(j)?.classList.add("flash"); setTimeout(() => rowEl(j)?.classList.remove("flash"), 1200); };
+        const clear = el("button", "linklike", "Clear highlights");
+        clear.onclick = () => { S.segs.forEach((x) => delete x.spk_changed); renderSegments(); renderSpeakers(); queueSave(); };
+        const row = el("div", "id-links"); row.append(nav, clear); box.append(row);
+      }
+      foot.append(box);
     }
     if (unsure) foot.append(el("small", null, `${unsure} line${unsure > 1 ? "s" : ""} where the speaker is unclear are in Needs review. Fixing them teaches it more.`));
   }
@@ -595,10 +613,16 @@
     if (r && Date.now() / 1000 - r.at < 60) return `Speakers updated: ${r.changed} line${r.changed === 1 ? "" : "s"} relabeled` + (r.unsure ? `, ${r.unsure} unclear` : "");
     return "Speakers updated";
   }
+  function correctionsSig() {
+    let h = 5381;
+    for (const s of S.segs) if (s.spk_locked) for (const c of `${s.id}:${s.speaker};`) h = ((h * 33) ^ c.charCodeAt(0)) >>> 0;
+    return h.toString(36);
+  }
   async function runIdentify(remember) {
     try {
       await flushSave();
-      S.current = await api(`/api/files/${S.current.id}/identify`, { method: "POST", body: JSON.stringify({ remember }) });
+      S.relabelCursor = -1;
+      S.current = await api(`/api/files/${S.current.id}/identify`, { method: "POST", body: JSON.stringify({ remember, sig: correctionsSig() }) });
       renderHeader(); await loadFiles(); schedulePoll();
     } catch (e) { toast(e.message, true); }
   }
@@ -642,7 +666,11 @@
     m.style.left = Math.min(r.left, innerWidth - mw - 8) + "px";
     m.style.top = (r.bottom + mh + 8 > innerHeight ? r.top - mh - 6 : r.bottom + 6) + "px";
   }
-  function hideSpkMenu() { $("spkMenu").classList.add("hidden"); S.spkTarget = null; }
+  function hideSpkMenu() {
+    const t = S.spkTarget != null ? S.segs[S.spkTarget] : null;
+    $("spkMenu").classList.add("hidden"); S.spkTarget = null;
+    if (t?._new && !t.text.trim()) dropEmptyInserted(t.id);
+  }
   $("spkMenu").querySelectorAll(".spk-scope button").forEach((b) => (b.onclick = (e) => {
     e.stopPropagation();
     S.spkScope = b.dataset.scope;
@@ -661,9 +689,10 @@
     const [a, b] = S.spkScope === "turn" ? turnRange(i) : [i, i];
     for (let k = a; k <= b; k++) {
       const s = S.segs[k];
-      s.speaker = id; s.spk_locked = true; s.spk_conf = 1;
+      s.speaker = id; s.spk_locked = true; s.spk_conf = 1; delete s.spk_changed;
       s.issues = (s.issues || []).filter((x) => !x.startsWith("Not sure who"));
     }
+    if (S.segs[i]?._new) S.focusSegId = S.segs[i].id;  // keep typing in the inserted line
     hideSpkMenu();
     renderSegments(); renderSpeakers(); queueSave();
   }
@@ -791,7 +820,7 @@
     S.segs.forEach((s, i) => {
       while (mi < mks.length && mks[mi].t <= s.start + 0.05) frag.append(divider(mks[mi++]));
       const turnStart = hasSpk && (i === 0 || S.segs[i - 1].speaker !== s.speaker);
-      const row = el("div", "seg" + (turnStart ? " turn" : ""));
+      const row = el("div", "seg" + (turnStart ? " turn" : "") + (s.spk_changed ? " relabeled" : ""));
       row.dataset.i = i;
       if (s.speaker) { row.dataset.spk = s.speaker; row.style.setProperty("--spk", spkColor(s.speaker)); }
       const left = el("div", "seg-left");
@@ -822,7 +851,17 @@
       const rv = el("button", "seg-review");
       rv.onclick = () => toggleReviewed(i);
       side.append(rv, conf);
-      row.append(left, txt, side);
+      if (s._new && !s.text) txt.dataset.placeholder = "Type what was said…";
+      const ins = el("button", "seg-insert", "+");
+      ins.title = "Insert a missed line here";
+      ins.onclick = (e) => { e.stopPropagation(); insertLine(i); };
+      row.append(left, txt, side, ins);
+      if (i === S.segs.length - 1) {
+        const after = el("button", "seg-insert after", "+");
+        after.title = "Add a line at the end";
+        after.onclick = (e) => { e.stopPropagation(); insertLine(i + 1); };
+        row.append(after);
+      }
       frag.append(row);
       decorateRow(row, s);
     });
@@ -831,6 +870,11 @@
     box.scrollTop = scroll;
     renderFlags();
     updateActive(true);
+    if (S.focusSegId != null) {  // a line was just inserted (or its speaker set): keep typing in it
+      const k = S.segs.findIndex((x) => x.id === S.focusSegId);
+      S.focusSegId = null;
+      if (k >= 0) placeCaret(rowEl(k).querySelector(".seg-text"), Infinity);
+    }
   }
 
   function decorateRow(row, s) {
@@ -885,6 +929,7 @@
     if (!txt || !txt.isConnected) return;
     const s = S.segs[+txt.parentElement.dataset.i];
     if (!s) return;
+    if (s._new) { if (!s.text.trim()) { dropEmptyInserted(s.id); return; } delete s._new; }
     if (s.edited && s.words && s.words.length && !wordsMatch(s)) s.words = [];
     fillText(txt, s);
     if (+txt.parentElement.dataset.i === S.activeIdx) { S.activeWord = -2; updateActive(); }
@@ -952,6 +997,44 @@
   }
 
   function nextId() { return S.segs.reduce((m, s) => Math.max(m, s.id), -1) + 1; }
+  // Insert a missed line before index i, timed in the gap between its neighbours.
+  function insertLine(i) {
+    if (isBusy(S.current)) { toast("Wait for the current job to finish", true); return; }
+    const prev = S.segs[i - 1], next = S.segs[i];
+    let start, end;
+    if (prev && next) {
+      if (next.start - prev.end >= 0.2) { start = prev.end; end = next.start; }  // fill the pause between them
+      else { start = Math.max((prev.start + next.start) / 2, next.start - 0.05); end = next.start + 0.6; }  // no pause: sit on the boundary
+    } else if (next) {
+      start = Math.max(0, next.start - 2); end = next.start;
+    } else {
+      start = prev ? prev.end : 0; end = start + 2;
+    }
+    if (S.current?.duration) { start = Math.min(start, S.current.duration); end = Math.min(Math.max(end, start + 0.2), S.current.duration); }
+    // likely speaker: the other person when both neighbours are the same speaker
+    const ids = Object.keys(S.speakers);
+    let spk = prev?.speaker ?? next?.speaker ?? ids[0] ?? null;
+    if (prev && next && prev.speaker && prev.speaker === next.speaker && ids.length === 2) spk = ids.find((x) => x !== prev.speaker);
+    else if (prev && next && prev.speaker !== next.speaker) spk = next.speaker;
+    const seg = { id: nextId(), start: +start.toFixed(3), end: +end.toFixed(3), text: "", speaker: spk, edited: true, reviewed: true,
+      words: [], issues: [], low_words: [], confidence: null, _new: true, ...(spk ? { spk_locked: true } : {}) };
+    S.segs.splice(i, 0, seg);
+    S.focusSegId = seg.id;
+    renderSegments();
+    const row = rowEl(i);
+    if (ids.length) showSpkMenu(i, row.querySelector(".spk-chip") || row, false);
+  }
+  function dropEmptyInserted(id) {
+    setTimeout(() => {
+      const k = S.segs.findIndex((x) => x.id === id);
+      if (k < 0) return;
+      const s = S.segs[k];
+      const row = rowEl(k);
+      if (!s._new || s.text.trim() || S.spkTarget === k || (row && row.contains(document.activeElement))) return;
+      S.segs.splice(k, 1);
+      renderSegments(); queueSave();
+    }, 250);
+  }
   function splitAt(i, offset) {
     const s = S.segs[i];
     const text = s.text;
@@ -1025,6 +1108,7 @@
         reviewed: !!s.reviewed, edited: !!s.edited, words: s.words || [],
         confidence: s.confidence ?? null, issues: s.issues || [], low_words: s.low_words || [],
         ...(s.spk_locked ? { spk_locked: true } : {}), ...(s.spk_conf != null ? { spk_conf: s.spk_conf } : {}),
+        ...(s.spk_changed ? { spk_changed: true } : {}),
       })),
       speakers: S.speakers,
       markers: S.markers.map(({ id, t, end, label, color }) => ({ id, t, end: end ?? null, label, color })),
@@ -1641,9 +1725,8 @@
   function teachPending(f) { return Object.prototype.hasOwnProperty.call(teachList(), f.id); }
   function teachForget(id) { const l = teachList(); delete l[id]; store.set("teachAfter", l); }
 
-  function wizAdd(tid, name) {
-    if (!S.wiz) {
-      S.wiz = { items: new Map(), started: null };
+  function wizSetup(mode) {
+      S.wiz = { mode, items: new Map(), started: null };
       const sel = $("wzModel");
       sel.innerHTML = "";
       for (const o of $("modelSelect").options) sel.append(new Option(o.text, o.value));
@@ -1654,14 +1737,49 @@
       wizPick(store.get("wizSpeakers", "auto"));
       $("wzTeach").checked = store.get("wizTeach", true);
       $("wzAlways").checked = true;
+      $("wzLang").value = $("languageInput").value.trim();
+      $("wzVocab").value = store.get("wizVocab", "");
+      wizMoreSummary();
+      $("wzAlwaysWrap").classList.toggle("hidden", mode !== "upload");
+      $("wzKeepWrap").classList.add("hidden");
+      $("wzStart").textContent = "Start transcription";
       $("wizard").classList.remove("hidden");
       setTimeout(() => $("wzStart").focus(), 50);
-    }
+  }
+  function wizMoreSummary() {
+    const bits = [];
+    if ($("wzLang").value.trim()) bits.push($("wzLang").value.trim());
+    const n = $("wzVocab").value.split(/[,\n;]/).filter((x) => x.trim()).length;
+    if (n) bits.push(`${n} term${n > 1 ? "s" : ""}`);
+    $("wzMoreSummary").textContent = bits.length ? "· " + bits.join(" · ") : "";
+  }
+  $("wzLang").oninput = wizMoreSummary;
+  $("wzVocab").oninput = wizMoreSummary;
+  function wizAdd(tid, name) {
+    if (!S.wiz) wizSetup("upload");
     S.wiz.items.set(tid, { name, fid: null });
     wizRender();
   }
+  function openReprocess() {
+    const f = S.current;
+    if (!f || S.wiz) return;
+    wizSetup("reprocess");
+    S.wiz.fid = f.id;
+    const prev = S.transcript?.options || {};
+    if (prev.vocabulary) $("wzVocab").value = prev.vocabulary;
+    if (prev.language) $("wzLang").value = prev.language;
+    wizMoreSummary();
+    $("wzKeepWrap").classList.toggle("hidden", !f.has_transcript);
+    $("wzKeep").checked = true;
+    $("wzTitle").textContent = f.has_transcript ? "Transcribe again" : "Transcribe";
+    $("wzStart").textContent = f.has_transcript ? "Re-transcribe" : "Start transcription";
+    const ul = $("wzFiles"); ul.innerHTML = "";
+    const li = el("li");
+    li.append(el("span", null, f.name), el("span", null, f.has_transcript ? `current: ${f.model || "transcript"}` : ""));
+    ul.append(li);
+  }
   function wizRender() {
-    if (!S.wiz) return;
+    if (!S.wiz || S.wiz.mode !== "upload") return;
     const ul = $("wzFiles");
     ul.innerHTML = "";
     for (const [tid, it] of S.wiz.items) {
@@ -1718,11 +1836,29 @@
     const speakers = wizSpeakers();
     const model = $("wzModel").value;
     store.set("wizSpeakers", speakers); store.set("wizModel", model); store.set("wizTeach", $("wzTeach").checked);
+    store.set("wizVocab", $("wzVocab").value.trim());
     const body = { model };
-    const lang = $("languageInput").value.trim();
+    const lang = $("wzLang").value.trim();
     if (lang) body.language = lang;
+    const vocab = $("wzVocab").value.trim();
+    if (vocab) body.vocabulary = vocab;
     if (S.config?.diarization_available || /moss/i.test(model)) body.speakers = speakers;
     const o = { body, teach: $("wzTeach").checked && speakers !== "off", expected: parseInt(speakers, 10) || null };
+    if (W.mode === "reprocess") {
+      const f = S.current;
+      if (!f || f.id !== W.fid) { wizClose(); return; }
+      body.keep_previous = $("wzKeep").checked || !f.has_transcript;
+      try {
+        await flushSave();
+        if (o.teach) { const l = teachList(); l[f.id] = o.expected; store.set("teachAfter", l); }
+        S.current = await api(`/api/files/${f.id}/transcribe`, { method: "POST", body: JSON.stringify(body) });
+        wizClose();
+        toast(body.keep_previous && f.has_transcript ? "Re-transcribing. The current transcript is kept under Versions" : "Transcription started");
+        renderHeader();
+        await loadFiles(); schedulePoll();
+      } catch (e) { toast(e.message, true); teachForget(f.id); }
+      return;
+    }
     S.wizStarted = S.wizStarted || new Map();
     let waiting = 0;
     for (const [tid, it] of W.items) {
@@ -1735,7 +1871,7 @@
   }
   function wizLater() { wizClose(); }
   function wizClose() {
-    if (!$("wzAlways").checked) { store.set("wizard", false); $("wizToggle").checked = false; $("autoToggleWrap").classList.remove("hidden"); toast("Guided upload is off. Turn it back on with the Guided switch at the top."); }
+    if (S.wiz?.mode === "upload" && !$("wzAlways").checked) { store.set("wizard", false); $("wizToggle").checked = false; $("autoToggleWrap").classList.remove("hidden"); toast("Guided upload is off. Turn it back on with the Guided switch at the top."); }
     S.wiz = null;
     $("wizard").classList.add("hidden");
   }
@@ -2027,6 +2163,8 @@
 
   // ------------------------------------------------------------------ keyboard
   document.addEventListener("keydown", (e) => {
+    if (S.modal) { if (e.key === "Escape") { e.preventDefault(); closeModal(); } return; }
+    if ((e.ctrlKey || e.metaKey) && !e.altKey && e.key.toLowerCase() === "h" && S.current) { e.preventDefault(); openFind(); return; }
     if (S.wiz) { // guided upload dialog open
       if (e.key === "Escape") { e.preventDefault(); wizLater(); }
       else if (e.key === "Enter" && !e.target.closest("select")) { e.preventDefault(); wizStart(); }
@@ -2070,6 +2208,222 @@
     }
   });
 
+  // ------------------------------------------------------------------ account
+  async function loadMe() {
+    try {
+      const m = await (await fetch("/api/auth/me")).json();
+      S.me = m.user; S.accounts = m.accounts;
+      if (!m.accounts) {  // single-user mode: only the benchmark tools
+        $("acctWrap").classList.remove("hidden");
+        $("acctName").textContent = "Tools";
+        $("acctAvatar").textContent = "⚙";
+        $("adminLink").classList.remove("hidden");
+        $("adminLink").href = "admin.html#bench";
+        $("adminLink").querySelector("b").textContent = "Model benchmarks";
+        $("adminLink").querySelector("small").textContent = "Compare how accurate your models are";
+        $("pwBtn").classList.add("hidden"); $("logoutBtn").classList.add("hidden");
+        return;
+      }
+      if (!m.user) return;
+      $("acctWrap").classList.remove("hidden");
+      $("acctName").textContent = m.user.name || m.user.username;
+      $("acctAvatar").textContent = (m.user.name || m.user.username || "?").trim()[0].toUpperCase();
+      $("adminLink").classList.toggle("hidden", !m.user.admin);
+      $("pwBtn").classList.toggle("hidden", !!m.user.env_admin);
+    } catch { /* single-user mode */ }
+  }
+  bindMenu("acctBtn");
+  $("logoutBtn").onclick = async () => {
+    await flushSave();
+    await fetch("/api/auth/logout", { method: "POST" });
+    location.href = "/login.html";
+  };
+  const openModal = (id) => { closeMenus(); S.modal = id; $(id).classList.remove("hidden"); };
+  const closeModal = () => { if (S.modal) $(S.modal).classList.add("hidden"); S.modal = null; };
+  $("pwBtn").onclick = () => { $("pwForm").reset(); $("pwError").textContent = ""; openModal("pwModal"); setTimeout(() => $("pwCurrent").focus(), 30); };
+  $("pwClose").onclick = closeModal;
+  $("pwForm").onsubmit = async (e) => {
+    e.preventDefault();
+    if ($("pwNew").value !== $("pwNew2").value) { $("pwError").textContent = "The new passwords don't match"; return; }
+    try {
+      await api("/api/auth/password", { method: "POST", body: JSON.stringify({ current: $("pwCurrent").value, new: $("pwNew").value }) });
+      closeModal(); toast("Password changed");
+    } catch (err) { $("pwError").textContent = err.message; }
+  };
+
+  // ------------------------------------------------------------------ versions
+  async function loadVersions() {
+    const f = S.current;
+    S.versions = [];
+    if (f && f.has_transcript) {
+      try { S.versions = await api(`/api/files/${f.id}/versions`); } catch { S.versions = []; }
+    }
+    if (S.current !== f) return;
+    renderVersions();
+  }
+  function renderVersions() {
+    const v = S.versions || [];
+    $("versionsWrap").classList.toggle("hidden", v.length < 2);
+    $("versionsBtn").textContent = `Versions (${v.length}) ▾`;
+    const box = $("versionsMenu");
+    box.innerHTML = "";
+    box.append(el("div", "vp-head", "Each run is kept here. Switching keeps your edits in every version."));
+    for (const ver of v) {
+      const row = el("div", "vp-row" + (ver.active ? " active" : ""));
+      const main = el("button", "vp-main");
+      const when = ver.created ? new Date(ver.created * 1000).toLocaleString([], { month: "short", day: "numeric", hour: "numeric", minute: "2-digit" }) : "";
+      main.append(el("b", null, ver.model || "transcript"));
+      const bits = [when, `${ver.words} words`, ver.speakers ? `${ver.speakers} speakers` : null, ver.edited ? "edited" : null,
+        ver.options?.vocabulary ? "custom terms" : null].filter(Boolean);
+      main.append(el("small", null, bits.join(" · ")));
+      if (ver.active) main.append(el("span", "vp-badge", "showing"));
+      main.onclick = () => activateVersion(ver);
+      row.append(main);
+      if (!ver.active) {
+        const del = el("button", "vp-del", "✕");
+        del.title = "Delete this version";
+        del.onclick = (e) => { e.stopPropagation(); deleteVersion(ver); };
+        row.append(del);
+      }
+      box.append(row);
+    }
+  }
+  bindMenu("versionsBtn");
+  async function activateVersion(ver) {
+    closeMenus();
+    if (ver.active || !S.current) return;
+    if (isBusy(S.current)) { toast("Wait for the current job to finish", true); return; }
+    try {
+      await flushSave();
+      const t = await api(`/api/files/${S.current.id}/versions/${ver.id}/activate`, { method: "POST" });
+      S.transcript = t; S.segs = t.segments; S.speakers = t.speakers || {}; S.markers = t.markers || S.markers;
+      renderSegments(); renderSpeakers(); renderMarkers();
+      await loadFiles(); loadVersions();
+      toast(`Showing the ${ver.model || "earlier"} transcript`);
+    } catch (e) { toast(e.message, true); }
+  }
+  async function deleteVersion(ver) {
+    if (!confirm(`Delete the ${ver.model || ""} version from ${new Date(ver.created * 1000).toLocaleString()}? This can't be undone.`)) return;
+    try {
+      S.versions = (await api(`/api/files/${S.current.id}/versions/${ver.id}`, { method: "DELETE" })).versions;
+      renderVersions(); toast("Version deleted");
+    } catch (e) { toast(e.message, true); }
+  }
+
+  // ------------------------------------------------------------------ file actions
+  $("renameBtn").onclick = () => {
+    closeMenus();
+    const t = $("fileTitle"); t.focus();
+    const r = document.createRange(); r.selectNodeContents(t);
+    const sel = getSelection(); sel.removeAllRanges(); sel.addRange(r);
+  };
+  $("copyFileBtn").onclick = async () => {
+    closeMenus();
+    if (!S.current) return;
+    try {
+      await flushSave();
+      const m = await api(`/api/files/${S.current.id}/copy`, { method: "POST" });
+      await loadFiles(); await openFile(m.id); toast(`Made a copy: ${m.name}`);
+    } catch (e) { toast(e.message, true); }
+  };
+  function copyToClipboard(text) {
+    if (navigator.clipboard && window.isSecureContext) return navigator.clipboard.writeText(text);
+    const ta = el("textarea"); ta.value = text; ta.style.position = "fixed"; ta.style.opacity = "0";
+    document.body.append(ta); ta.select();
+    const ok = document.execCommand("copy"); ta.remove();
+    return ok ? Promise.resolve() : Promise.reject(new Error("Copy failed"));
+  }
+  $("copyTextBtn").onclick = async () => {
+    closeMenus();
+    if (!S.current || !S.transcript) return;
+    try {
+      await flushSave();
+      const r = await fetch(`/api/files/${S.current.id}/download?format=txt`);
+      if (!r.ok) throw new Error("Couldn't build the text");
+      await copyToClipboard(await r.text());
+      toast("Transcript copied");
+    } catch (e) { toast(e.message, true); }
+  };
+
+  // ------------------------------------------------------------------ find & replace
+  const TOKEN_SPLIT = /(\[REDACTED(?::[a-z0-9]+)?\])/;
+  function frRegex() {
+    const q = $("frFind").value;
+    if (!q) return null;
+    const esc = q.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+    return new RegExp($("frWord").checked ? `(?<![\\p{L}\\p{N}_])${esc}(?![\\p{L}\\p{N}_])` : esc, "gu" + ($("frCase").checked ? "" : "i"));
+  }
+  function frMatches() {
+    const re = frRegex();
+    const out = [];
+    if (!re) return out;
+    S.segs.forEach((s, i) => {
+      let n = 0;
+      for (const part of s.text.split(TOKEN_SPLIT)) if (!TOKEN_SPLIT.test(part)) n += (part.match(re) || []).length;
+      if (n) out.push({ i, n });
+    });
+    return out;
+  }
+  function frUpdate() {
+    const m = frMatches();
+    const total = m.reduce((a, x) => a + x.n, 0);
+    $("frCount").textContent = $("frFind").value ? (total ? `${total} match${total > 1 ? "es" : ""} in ${m.length} line${m.length > 1 ? "s" : ""}` : "No matches") : "";
+    $("frApply").disabled = !total;
+    $("frApply").textContent = total ? `Replace ${total}` : "Replace all";
+    const ul = $("frPreview"); ul.innerHTML = "";
+    const re = frRegex();
+    for (const { i } of m.slice(0, 6)) {
+      const li = el("li");
+      li.append(el("span", "fr-time", fmt(S.segs[i].start)));
+      const txt = el("span");
+      let last = 0; const t = S.segs[i].text.replace(/\[REDACTED(?::[a-z0-9]+)?\]/g, "[REDACTED]");
+      for (const mm of t.matchAll(re)) {
+        txt.append(document.createTextNode(t.slice(last, mm.index)));
+        txt.append(el("mark", null, mm[0])); last = mm.index + mm[0].length;
+      }
+      txt.append(document.createTextNode(t.slice(last)));
+      li.append(txt);
+      li.onclick = () => { closeModal(); rowEl(i)?.scrollIntoView({ block: "center" }); };
+      ul.append(li);
+    }
+    if (m.length > 6) ul.append(el("li", "muted", `…and ${m.length - 6} more lines`));
+  }
+  function openFind() {
+    if (!S.current || !S.segs.length) return;
+    if (isBusy(S.current)) { toast("Wait for the current job to finish", true); return; }
+    const sel = getSelection().toString().trim();
+    if (sel && sel.length < 60 && !sel.includes("\n")) $("frFind").value = sel;
+    openModal("findModal"); frUpdate();
+    setTimeout(() => { $("frFind").focus(); $("frFind").select(); }, 30);
+  }
+  $("findBtn").onclick = openFind;
+  $("frClose").onclick = closeModal;
+  for (const id of ["frFind", "frCase", "frWord"]) $(id).addEventListener("input", frUpdate);
+  $("frReplace").addEventListener("keydown", (e) => { if (e.key === "Enter" && !$("frApply").disabled) $("frApply").click(); });
+  $("frFind").addEventListener("keydown", (e) => { if (e.key === "Enter") $("frReplace").focus(); });
+  $("frApply").onclick = () => {
+    const re = frRegex(); if (!re) return;
+    const rep = $("frReplace").value;
+    let changed = 0, count = 0;
+    for (const { i } of frMatches()) {
+      const s = S.segs[i];
+      const text = s.text.split(TOKEN_SPLIT).map((part) => TOKEN_SPLIT.test(part) ? part : part.replace(re, () => { count++; return rep; })).join("");
+      if (text !== s.text) {
+        s.text = text; s.edited = true;
+        if (s.words?.length && s.words.map((w) => w.w).join("").trim() !== text.trim()) s.words = [];  // re-timed in the browser
+        changed++;
+      }
+    }
+    closeModal();
+    renderSegments(); queueSave();
+    toast(`Replaced ${count} in ${changed} line${changed === 1 ? "" : "s"}`);
+  };
+  for (const id of ["findModal", "pwModal"]) {
+    let down = false;
+    $(id).addEventListener("mousedown", (e) => { down = e.target.id === id; });
+    $(id).addEventListener("click", (e) => { if (e.target.id === id && down) closeModal(); });
+  }
+
   // ------------------------------------------------------------------ empty state art
   (() => {
     const g = $("emptyBars");
@@ -2084,6 +2438,7 @@
 
   // ------------------------------------------------------------------ boot
   (async () => {
+    await loadMe();
     await loadConfig();
     loadVoices();
     await loadFiles();

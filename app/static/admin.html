@@ -1,0 +1,123 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Admin · TranscribeR</title>
+  <link rel="icon" href="favicon.svg" type="image/svg+xml">
+  <link rel="apple-touch-icon" href="apple-touch-icon.png">
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="styles.css">
+</head>
+<body class="admin-page">
+  <header class="topbar">
+    <a class="brand" href="/" title="Back to transcripts">
+      <svg class="logo" viewBox="0 0 32 32" aria-hidden="true"><rect x="3" y="12" width="3" height="8" rx="1.5"/><rect x="9" y="7" width="3" height="18" rx="1.5"/><rect x="15" y="3" width="3" height="26" rx="1.5"/><rect x="21" y="9" width="3" height="14" rx="1.5"/><rect x="27" y="13" width="3" height="6" rx="1.5"/></svg>
+      <span>Transcribe<b>R</b></span><span class="admin-tag">Admin</span>
+    </a>
+    <nav class="admin-tabs" role="tablist">
+      <button role="tab" data-tab="users" class="on">Users</button>
+      <button role="tab" data-tab="bench">Benchmarks</button>
+    </nav>
+    <div class="top-controls"><a class="btn sm" href="/">← Back to transcripts</a></div>
+  </header>
+
+  <main class="admin-main">
+    <!-- users -->
+    <section id="tab-users" class="admin-tab">
+      <div class="admin-head">
+        <div><h2>Users</h2><p class="muted">People sign in with the username and password you give them. Everyone only sees their own recordings and transcripts.</p></div>
+        <button class="btn primary" id="addUserBtn">+ Add user</button>
+      </div>
+      <div class="card table-card"><table class="admin-table" id="userTable">
+        <thead><tr><th>User</th><th>Role</th><th class="num">Files</th><th class="num">Audio</th><th class="num">Storage</th><th>Last sign-in</th><th></th></tr></thead>
+        <tbody></tbody>
+      </table></div>
+    </section>
+
+    <!-- benchmarks -->
+    <section id="tab-bench" class="admin-tab hidden">
+      <div class="admin-head">
+        <div><h2>Model benchmarks</h2><p class="muted">Transcribe one recording with several models and score each against a reference transcript you trust: word error rate, speaker accuracy and speed.</p></div>
+        <button class="btn primary" id="newBenchBtn">+ New benchmark</button>
+      </div>
+      <div class="bench-layout">
+        <ul class="bench-list" id="benchList"></ul>
+        <div class="bench-detail card" id="benchDetail">
+          <div class="bench-empty muted">Create a benchmark, or pick one on the left.</div>
+        </div>
+      </div>
+    </section>
+  </main>
+
+  <!-- add user -->
+  <div class="modal hidden" id="userModal" role="dialog" aria-modal="true" aria-labelledby="umTitle">
+    <form class="modal-card small-card" id="userForm" autocomplete="off">
+      <div class="modal-head"><h3 id="umTitle">Add user</h3><button type="button" class="btn icon sm" data-close>✕</button></div>
+      <div class="modal-body">
+        <label class="form-row"><span>Username <small class="muted">used to sign in</small></span><input id="umUser" required pattern="[A-Za-z0-9._@\-]{2,40}"></label>
+        <label class="form-row"><span>Display name</span><input id="umName" placeholder="optional"></label>
+        <label class="form-row"><span>Password <small class="muted">at least 8 characters</small></span>
+          <div class="pw-row"><input id="umPass" required minlength="8"><button type="button" class="btn sm" id="umGen">Generate</button></div></label>
+        <label class="toggle"><input type="checkbox" id="umAdmin"><span class="switch"></span><span>Admin (can manage users and run benchmarks)</span></label>
+        <div class="login-error" id="umError"></div>
+      </div>
+      <div class="modal-foot"><span class="muted small">Share the username and password with them.</span><button class="btn primary" type="submit">Add user</button></div>
+    </form>
+  </div>
+
+  <!-- new benchmark -->
+  <div class="modal hidden" id="benchModal" role="dialog" aria-modal="true" aria-labelledby="bmTitle">
+    <form class="modal-card" id="benchForm">
+      <div class="modal-head"><h3 id="bmTitle">New benchmark</h3><button type="button" class="btn icon sm" data-close>✕</button></div>
+      <div class="modal-body">
+        <label class="form-row"><span>Name</span><input id="bmName" placeholder="e.g. Podcast ep. 12, 10-minute excerpt"></label>
+        <div class="seg-switch" role="radiogroup">
+          <button type="button" data-src="file" class="on">From my library</button>
+          <button type="button" data-src="upload">Upload audio</button>
+        </div>
+        <div id="bmFromFile">
+          <label class="form-row"><span>Recording</span><select id="bmFile"></select></label>
+          <p class="muted small" id="bmFileHint">Its current transcript becomes the reference. Correct it first (edits, speaker names) so it really is right. Redacted parts are skipped when scoring.</p>
+        </div>
+        <div id="bmFromUpload" class="hidden">
+          <label class="form-row"><span>Audio file</span><input type="file" id="bmAudio" accept="audio/*,video/*"></label>
+        </div>
+        <details class="wz-more" id="bmRefMore">
+          <summary>Reference transcript <small id="bmRefSummary">from the recording's transcript</small></summary>
+          <label class="form-row"><span>Paste it <small class="muted">plain text, or one line per turn as "Name: text" to score speakers</small></span>
+            <textarea id="bmRefText" rows="6" placeholder="Alice: Welcome back to the show.&#10;Bob: Thanks for having me."></textarea></label>
+          <label class="form-row"><span>…or upload <small class="muted">.txt, .srt or .vtt</small></span><input type="file" id="bmRefFile" accept=".txt,.srt,.vtt,text/plain"></label>
+        </details>
+        <div class="login-error" id="bmError"></div>
+      </div>
+      <div class="modal-foot"><span></span><button class="btn primary" type="submit" id="bmCreate">Create benchmark</button></div>
+    </form>
+  </div>
+
+  <!-- diff -->
+  <div class="modal hidden" id="diffModal" role="dialog" aria-modal="true" aria-labelledby="dfTitle">
+    <div class="modal-card wide-card">
+      <div class="modal-head"><h3 id="dfTitle">Differences</h3><button type="button" class="btn icon sm" data-close>✕</button></div>
+      <div class="modal-body">
+        <div class="diff-legend"><span class="d-sub">wrong word <i>→ heard</i></span><span class="d-del">missed</span><span class="d-ins">extra</span><span class="d-red">redacted</span>
+          <label class="toggle"><input type="checkbox" id="dfErrorsOnly"><span class="switch"></span><span>Only show errors</span></label></div>
+        <div class="diff-body" id="diffBody"></div>
+      </div>
+    </div>
+  </div>
+
+  <div class="modal hidden" id="credModal" role="dialog" aria-modal="true" aria-labelledby="crTitle">
+    <div class="modal-card small-card">
+      <div class="modal-head"><h3 id="crTitle">Sign-in details</h3><button type="button" class="btn icon sm" data-close>✕</button></div>
+      <div class="modal-body">
+        <p class="muted small">Send these to the user. The password isn't shown again (you can always reset it).</p>
+        <pre class="cred-box" id="credText"></pre>
+      </div>
+      <div class="modal-foot"><span></span><button class="btn primary" id="credCopy">Copy</button></div>
+    </div>
+  </div>
+  <div class="toast" id="toast"></div>
+  <script src="admin.js"></script>
+</body>
+</html>

@@ -23,6 +23,7 @@ from __future__ import annotations
 import argparse
 import json
 import logging
+import re
 import subprocess
 import threading
 from email.parser import BytesParser
@@ -72,7 +73,8 @@ def transcribe(pcm: np.ndarray, form: dict) -> dict:
         except tc.OutputTruncated as exc:
             r, truncated = exc.partial_result, True
     segs = [{"id": i, "start": sg.t0_ms / 1000, "end": sg.t1_ms / 1000,
-             "speaker": f"S{sg.speaker_id:02d}" if sg.speaker_id > 0 else None, "text": sg.text.strip()}
+             "speaker": f"S{sg.speaker_id:02d}" if sg.speaker_id > 0 else None,
+             "text": re.sub(r"\s{2,}", " ", re.sub(r"\s*\[(?:\d+(?:\.\d+)?|S\d+)\]\s*", " ", sg.text)).strip()}
             for i, sg in enumerate(r.segments) if sg.text.strip()]
     return {"text": r.text, "raw_text": r.raw_text, "language": r.language or kw.get("language"),
             "duration": len(pcm) / 16000, "segments": segs, "truncated": truncated}

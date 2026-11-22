@@ -9,6 +9,27 @@ A self-hosted web front end for speech-to-text models served through [llama-swap
 - **Speaker detection** (diarization) runs on the CPU inside the container alongside transcription. Rename speakers, reassign a line or a whole turn, add speakers, and re-run detection without losing your text edits.
 - **Guided upload**: after you drop a file, a dialog asks how many speakers to expect (or *I don't know*) and which model to use (built-in MOSS by default), then starts it. When the transcript is ready, the Teach dialog opens so you can tag a few clips per person. Turn it off with the *Guided* switch in the top bar (then *Auto-transcribe* applies).
 - **Stop a job** at any time from the progress card. A queued or running transcription, speaker detection or voice matching is cancelled, and any previous transcript is kept. Interrupted jobs otherwise resume after a container restart.
+- **Accounts** (optional): set *Admin username* and *Admin password* in the template to require sign-in.
+  - The admin adds people on the **Admin** page, and they sign in with the username and password the admin gives them.
+  - Everyone only sees their own recordings, transcripts and saved voices; admins included.
+  - Admins can reset passwords, disable or delete users, and move a deleted user's files to themselves.
+  - Without these settings, the app stays single-user with no login.
+- **File management**:
+  - Rename and copy files.
+  - Re-transcribe with a different model, speaker count, language or custom vocabulary. The current transcript is kept as a **version**, so you can switch between model outputs at any time (*Versions* menu) or delete old ones.
+  - Redactions apply to every version.
+- **Insert missed lines**: hover between two lines and click the green **+**.
+  - The new line is timed in the gap between its neighbours.
+  - It asks who said it, guessing the other speaker when both neighbours are the same person.
+- **Find & replace** (⋯ menu or Ctrl+H) with match case / whole word and a preview; redacted text is never touched.
+- **Names and special terms** in the transcribe dialog help models spell names right.
+  - MOSS hotwords, the whisper prompt, or an instruction in chat mode.
+- **Copy transcript** to the clipboard, and **Word (.docx)** and **Markdown** exports with speaker paragraphs.
+- **Model benchmarks** (Admin → Benchmarks):
+  - Pick a reviewed transcript from your library, or upload audio plus a reference (text, `Name: text` lines, SRT or VTT).
+  - Run several models on it.
+  - Each run shows accuracy (1 − WER), substitutions/deletions/insertions, CER, speaker accuracy, time and speed.
+  - A diff view shows every mistake.
 - **Edit as you go**: click into any segment and type. *Pause while typing* stops playback while you type and resumes about 1 second earlier once you stop. Edits save automatically.
 - **Uncertainty review**: segments with low model confidence, likely hallucinations (repeated text, implausibly fast speech, transcribed silence), and low-probability words are flagged. They show up in the review panel and as amber regions on the waveform. Jump between them with Alt+N / Alt+P and adjust the sensitivity slider live.
 - **Redaction**: select text and a floating bar offers *Redact*, *Everywhere* (every occurrence in the file) and *+ Mute audio*. It's also on right-click, and Alt+X redacts the selection. Exports always show `[REDACTED]`. **Click a redaction bar to unredact it** (text and any muted audio come back; the confirmation offers *Redact again*). Right-click a bar to **Erase permanently**. Grey bars are permanent redactions; clicking one offers **Recover from audio**, which re-transcribes the audio around it and fills in just the missing words (unless that audio was muted). Until erased, the original text is kept only in the file's `redactions.json` (and muted audio in an untouched `audio.original.mp3` backup), never in the transcript or exports. Before sharing sensitive material, use ⋯ → **Erase all redactions permanently**: this destroys the hidden originals, scrubs the copy used by *Revert edits*, and writes the silence into the backup audio.
@@ -45,6 +66,8 @@ Confidence flags need per-word or per-token probabilities. Chat mode and whisper
 Diarization uses [sherpa-onnx](https://github.com/k2-fsa/sherpa-onnx) with the pyannote segmentation 3.0 model and NeMo TitaNet-small speaker embeddings (about 45 MB, baked into the image). It runs on the CPU at roughly 15× real time with 4 threads, so a 90-minute file takes about 6 minutes and runs at the same time as GPU transcription. Choose *Auto* or a fixed speaker count in the top bar. A fixed count is more reliable when you know it (for example 2 for an interview). In *Auto*, clusters with the same voice are merged and tiny clusters are folded into the nearest voice, so noisy recordings don't explode into dozens of speakers.
 
 **Teach it who's who.** Click **Teach** in the Speakers panel, name the people in the file, play a few short clips and tag who's talking (2–3 per person is usually plenty). TranscribeR compares every line's voice fingerprint (TitaNet embedding) to your examples and relabels the whole file. Any line you later fix with the speaker menu counts as another example. Click **Update all from my corrections** to re-run. Lines where it can't tell are added to *Needs review*.
+
+**Update all from my corrections.** Every line you tag or fix with the speaker menu becomes a voice example. The button re-labels the rest of the file by voice from those examples and remembers the voices. It needs at least one tagged line per speaker (or a remembered voice). Afterwards the Speakers panel says how many lines changed, marks them with ↻, and the button returns only after new corrections.
 
 **Remembered voices.** With *Remember these voices* on, each person's voice is saved to `/data/voices.json`. Future files are labeled with their names automatically, and a remembered person needs no tagged clips in Teach.
 
@@ -160,13 +183,15 @@ See `docker-compose.yml` for the same setup as a compose file.
 | `MOSS_CHUNK_SECONDS` | `600` | Chunk length for the built-in engine |
 | `MOSS_REMOTE_MATCH` | `moss` | llama-swap model names (regex) that speak MOSS's format |
 | `MOSS_REMOTE_CHUNK_SECONDS` | `600` | Chunk length for MOSS through llama-swap |
+| `ADMIN_USERNAME` / `ADMIN_PASSWORD` | – | Turn on accounts. This admin is created/updated from these values at start |
+| `SESSION_SECRET` | random | Key for sign-in cookies (default: generated in `/data/secret.key`) |
 | `PORT` | `8000` | Port inside the container |
 
 Data is stored as plain files in `/data/files/<id>/`: `audio.mp3`, `peaks.json`, `transcript.json` (your edits), `transcript.orig.json` (the original model output, used by "Revert edits") and `meta.json`. There's no database.
 
 Jobs run one at a time so llama-swap isn't asked to swap models mid-job. Queued work resumes after a container restart.
 
-> There is no authentication. Keep it on your LAN or put it behind your reverse proxy's auth.
+> Without `ADMIN_USERNAME`/`ADMIN_PASSWORD` there is no authentication. Keep it on your LAN or behind your reverse proxy's auth. With accounts on, sign-in uses scrypt-hashed passwords and signed HTTP-only cookies (30 days); serve it over HTTPS if it's reachable from outside your network.
 
 ## Keyboard shortcuts
 
