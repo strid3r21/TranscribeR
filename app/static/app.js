@@ -888,7 +888,13 @@
     row.classList.toggle("dim", !!q && !s.text.toLowerCase().includes(q));
   }
 
-  function rowEl(i) { return $("segments").querySelector(`.seg[data-i="${i}"]`); }
+  function rowEl(i) {  // cached index -> row element (a querySelector per call is O(lines))
+    const r = S.rowEls && S.rowEls[i];
+    if (r && r.isConnected && +r.dataset.i === i) return r;
+    S.rowEls = [];
+    for (const el of $("segments").querySelectorAll(".seg")) S.rowEls[+el.dataset.i] = el;
+    return S.rowEls[i] || null;
+  }
 
   function toggleReviewed(i, value) {
     const s = S.segs[i];
@@ -1092,12 +1098,72 @@
     }
   }
 
-  $("searchInput").addEventListener("input", (e) => {
-    S.search = e.target.value.trim();
-    S.segs.forEach((s, i) => { const r = rowEl(i); if (r) { fillText(r.querySelector(".seg-text"), s); decorateRow(r, s); } });
+  // Search: debounced, and only lines whose highlighting changes are rebuilt (others just dim/undim).
+  let searchTimer = null;
+  S.searchHits = new Set();
+  function applySearch() {
+    S.search = $("searchInput").value.trim();
+    const q = S.search.toLowerCase();
+    const hits = new Set();
+    if (q) S.segs.forEach((s, i) => { if (s.text.toLowerCase().includes(q)) hits.add(i); });
+    rowEl(0);  // refresh the row cache once
+    const rows = S.rowEls || [];
+    const editing = document.activeElement?.closest?.(".seg-text");
+    S.segs.forEach((s, i) => {
+      const r = rows[i];
+      if (!r) return;
+      r.classList.toggle("dim", !!q && !hits.has(i));
+      if ((hits.has(i) || S.searchHits.has(i)) && r.querySelector(".seg-text") !== editing) fillText(r.querySelector(".seg-text"), s);
+    });
+    S.searchHits = hits;
     S.activeWord = -2;
-    const first = S.segs.findIndex((s) => S.search && s.text.toLowerCase().includes(S.search.toLowerCase()));
-    if (first >= 0) rowEl(first).scrollIntoView({ block: "center" });
+    // every occurrence, in order: [line index, nth mark in that line]
+    S.matches = [];
+    for (const i of [...hits].sort((a, b) => a - b)) {
+      const n = rows[i] ? rows[i].querySelectorAll(".seg-text mark").length : 0;
+      for (let k = 0; k < Math.max(1, n); k++) S.matches.push([i, k]);
+    }
+    $("searchNav").classList.toggle("hidden", !q);
+    if (!S.matches.length) { S.matchIdx = -1; updateSearchCount(); return; }
+    // start at the first match at or after the line being played / viewed
+    const from = Math.max(0, S.activeIdx);
+    const k = S.matches.findIndex(([i]) => i >= from);
+    gotoMatch(k >= 0 ? k : 0);
+  }
+  function updateSearchCount() {
+    const n = (S.matches || []).length;
+    $("searchCount").textContent = n ? `${S.matchIdx + 1} / ${n}` : "0 / 0";
+    $("searchCount").classList.toggle("none", !n);
+    $("searchPrev").disabled = $("searchNext").disabled = n < 2;
+  }
+  function gotoMatch(k) {
+    const m = S.matches || [];
+    if (!m.length) return;
+    S.matchIdx = ((k % m.length) + m.length) % m.length;
+    document.querySelectorAll(".seg-text mark.cur").forEach((x) => x.classList.remove("cur"));
+    const [i, nth] = m[S.matchIdx];
+    const row = rowEl(i);
+    const mark = row?.querySelectorAll(".seg-text mark")[nth];
+    if (mark) mark.classList.add("cur");
+    (mark || row)?.scrollIntoView({ block: "center" });
+    updateSearchCount();
+  }
+  $("searchNext").onclick = () => gotoMatch((S.matchIdx ?? -1) + 1);
+  $("searchPrev").onclick = () => gotoMatch((S.matchIdx ?? 0) - 1);
+  $("searchInput").addEventListener("input", () => {
+    clearTimeout(searchTimer);
+    searchTimer = setTimeout(applySearch, S.segs.length > 300 ? 180 : 60);
+  });
+  $("searchInput").addEventListener("keydown", (e) => {
+    if (e.key === "Enter") {
+      e.preventDefault();
+      const pending = $("searchInput").value.trim() !== S.search;
+      clearTimeout(searchTimer); searchTimer = null;
+      if (pending) applySearch(); else gotoMatch((S.matchIdx ?? -1) + (e.shiftKey ? -1 : 1));
+    } else if (e.key === "Escape" && $("searchInput").value) {
+      e.preventDefault(); e.stopPropagation();
+      $("searchInput").value = ""; applySearch();
+    }
   });
 
   // ------------------------------------------------------------------ saving

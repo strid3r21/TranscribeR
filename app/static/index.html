@@ -190,7 +190,14 @@
           <div class="transcript card" id="transcriptCard">
             <div class="card-head">
               <span>Transcript</span>
-              <input type="search" id="searchInput" placeholder="Search…">
+              <div class="search-box">
+                <input type="search" id="searchInput" placeholder="Search…" autocomplete="off">
+                <span class="search-nav hidden" id="searchNav">
+                  <span class="search-count" id="searchCount"></span>
+                  <button id="searchPrev" title="Previous match (Shift+Enter)" aria-label="Previous match">↑</button>
+                  <button id="searchNext" title="Next match (Enter)" aria-label="Next match">↓</button>
+                </span>
+              </div>
             </div>
             <div class="segments" id="segments"></div>
           </div>
