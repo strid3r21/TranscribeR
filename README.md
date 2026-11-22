@@ -15,12 +15,20 @@ A self-hosted web front end for speech-to-text models served through [llama-swap
   - Admins can reset passwords, disable or delete users, and move a deleted user's files to themselves.
   - Without these settings, the app stays single-user with no login.
 - **File management**:
-  - Rename and copy files.
+  - Rename files, and duplicate them from the file list (copy icon) or the ⋯ menu. The copy keeps everything, and you can re-transcribe it with another model straight away.
   - Re-transcribe with a different model, speaker count, language or custom vocabulary. The current transcript is kept as a **version**, so you can switch between model outputs at any time (*Versions* menu) or delete old ones.
   - Redactions apply to every version.
 - **Insert missed lines**: hover between two lines and click the green **+**.
   - The new line is timed in the gap between its neighbours.
   - It asks who said it, guessing the other speaker when both neighbours are the same person.
+- **Stats** (📊 above the transcript), computed from your edited transcript:
+  - For each speaker: talk time and share, words and words per minute, turns, longest uninterrupted stretch (click to jump), questions, filler words, interruptions, vocabulary, most-used words and signature phrases.
+  - A timeline of who talked when.
+  - Fun awards: Chatterbox, Speed talker, Longest monologue, Question master, Giggler, Um-ometer, Interrupter.
+- **Laughs, coughs & other sounds**: *Detect sounds* in Stats runs a small AudioSet tagger (CED-mini, CPU, about 30 s per hour of audio).
+  - It finds laughter, coughs, sneezes, throat clearing, sighs, gasps, crying, applause, singing, music and pets.
+  - Each sound is matched to a speaker by voice where possible, otherwise to whoever was talking.
+  - Sounds show as clickable emoji on the transcript lines and count toward each speaker's stats.
 - **Find & replace** (⋯ menu or Ctrl+H) with match case / whole word and a preview; redacted text is never touched.
 - **Names and special terms** in the transcribe dialog help models spell names right.
   - MOSS hotwords, the whisper prompt, or an instruction in chat mode.

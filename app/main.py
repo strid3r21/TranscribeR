@@ -28,6 +28,7 @@ import diarize
 import docx_export
 import moss
 import redact
+import sounds
 import settings as cfg
 
 logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO").upper(),
@@ -480,7 +481,44 @@ def settle_status(fid: str, **extra: Any) -> None:
     update_meta(fid, status="done" if done else "ready", queued_opts=None, **extra)
 
 
+async def job_sounds(fid: str, opts: dict) -> None:
+    """Find laughter, coughs, sneezes ... and who made them."""
+    d = fdir(fid)
+    update_meta(fid, status="diarizing", started_at=time.time(), error=None)
+    PROGRESS[fid] = {"stage": "sounds", "label": "Listening for laughs, coughs and other sounds"}
+    loop = asyncio.get_running_loop()
+
+    def progress(frac: float) -> None:
+        loop.call_soon_threadsafe(lambda: set_progress(fid, speakers=round(frac * 0.8, 3)))
+
+    try:
+        t = read_json(d / "transcript.json") or {"segments": []}
+
+        def work():
+            samples = diarize.load_samples(d / "audio.mp3")
+            events = sounds.detect(samples, progress)
+            if diarize.available() and t["segments"]:
+                sounds.attribute(events, samples, t["segments"])
+            return events
+
+        events = await loop.run_in_executor(None, work)
+        write_json(d / "sounds.json", {"created": time.time(), "model": "ced-mini", "events": events})
+        counts: dict[str, int] = {}
+        for e in events:
+            counts[e["label"]] = counts.get(e["label"], 0) + 1
+        log.info("sounds for %s: %s", fid, counts)
+        settle_status(fid, error=None, sounds=counts)
+    except Exception as exc:  # noqa: BLE001
+        log.exception("sound detection failed for %s", fid)
+        settle_status(fid, error=f"Sound detection failed: {exc}")
+    finally:
+        PROGRESS.pop(fid, None)
+
+
 async def run_job(fid: str, opts: dict) -> None:
+    if opts.get("job") == "sounds":
+        await job_sounds(fid, opts)
+        return
     if opts.get("job") == "diarize":
         await job_diarize(fid, opts)
     elif opts.get("job") == "identify":
@@ -1528,6 +1566,31 @@ async def bench_diff(bid: str, rid: str) -> dict:
     if not data:
         raise HTTPException(404, "No result for this run")
     return {"diff": data["diff"]}
+
+
+# ---- sounds --------------------------------------------------------------- #
+
+
+@app.get("/api/files/{fid}/sounds")
+async def get_sounds(fid: str) -> dict:
+    load_meta(fid)
+    data = read_json(fdir(fid) / "sounds.json")
+    return {"available": sounds.available(), "detected": data is not None,
+            "groups": {g: {"emoji": v[2], "personal": g in sounds.PERSONAL} for g, v in sounds.GROUPS.items()},
+            **(data or {"events": []})}
+
+
+@app.post("/api/files/{fid}/sounds")
+async def start_sounds(fid: str) -> dict:
+    meta = load_meta(fid)
+    if not sounds.available():
+        raise HTTPException(501, "The sound model is not installed in this image")
+    if meta["status"] in ACTIVE_STATES:
+        raise HTTPException(409, f"File is {meta['status']}, try again when it has finished")
+    if not (fdir(fid) / "audio.mp3").exists():
+        raise HTTPException(409, "The audio for this file was deleted")
+    await enqueue(fid, {"job": "sounds"})
+    return public_meta(load_meta(fid))
 
 
 # ---- versions & copies ---------------------------------------------------- #

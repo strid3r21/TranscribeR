@@ -190,8 +190,10 @@
           <div class="transcript card" id="transcriptCard">
             <div class="card-head">
               <span>Transcript</span>
+              <button class="btn sm stats-btn" id="statsBtn" title="Who talked most, favourite words, laughs and more">📊 Stats</button>
               <div class="search-box">
                 <input type="search" id="searchInput" placeholder="Search…" autocomplete="off">
+                <button class="search-clear hidden" id="searchClear" title="Clear search (Esc)" aria-label="Clear search">✕</button>
                 <span class="search-nav hidden" id="searchNav">
                   <span class="search-count" id="searchCount"></span>
                   <button id="searchPrev" title="Previous match (Shift+Enter)" aria-label="Previous match">↑</button>
@@ -372,6 +374,13 @@
       <div class="modal-foot"><span></span><button class="btn primary" type="submit">Change password</button></div>
     </form>
   </div>
+  <div class="modal hidden" id="statsModal" role="dialog" aria-modal="true" aria-labelledby="stTitle">
+    <div class="modal-card stats-card">
+      <div class="modal-head"><h3 id="stTitle">Conversation stats</h3><button class="btn icon sm" id="stClose" title="Close">✕</button></div>
+      <div class="modal-body" id="statsBody"></div>
+    </div>
+  </div>
+  <div class="chart-tip hidden" id="chartTip" role="tooltip"></div>
   <div class="toast" id="toast"></div>
   <script src="app.js"></script>
 </body>

@@ -98,6 +98,7 @@
   const cssVar = (n) => getComputedStyle(document.documentElement).getPropertyValue(n).trim();
   const svg = (paths) => { const s = document.createElementNS("http://www.w3.org/2000/svg", "svg"); s.setAttribute("viewBox", "0 0 24 24"); s.innerHTML = paths; return s; };
   const ICON_FILE = '<path d="M9 18V5l12-2v13"/><circle cx="6" cy="18" r="3"/><circle cx="18" cy="16" r="3"/>';
+  const ICON_COPY = '<rect x="9" y="9" width="11" height="11" rx="2"/><path d="M5 15V6a2 2 0 0 1 2-2h9"/>';
   const ICON_TRASH = '<path d="M4 7h16M10 11v6M14 11v6M6 7l1 12a2 2 0 0 0 2 2h6a2 2 0 0 0 2-2l1-12M9 7V4h6v3"/>';
 
   // ------------------------------------------------------------------ config
@@ -174,6 +175,12 @@
       await loadTranscript();
       if (f.status === "done" && !f.error) {
         if (prev.status !== "diarizing" && teachPending(f)) teachAfter(f);
+        else if (S.pendingSounds === f.id) {
+          S.pendingSounds = null;
+          const c = Object.entries(f.sounds || {}).sort((a, b) => b[1] - a[1]);
+          toast(c.length ? `Found ${c.map(([l, n]) => `${n} ${l.toLowerCase()}`).join(", ")}` : "No laughs, coughs or other sounds found", false,
+            { label: "Show stats", fn: () => $("statsBtn").click() });
+        }
         else toast(prev.status === "diarizing" ? speakerToast(f) : "Transcription finished");
       }
       if (prev.status === "diarizing") loadVoices();
@@ -222,9 +229,13 @@
       if (f.duration) sub.append(el("span", null, fmt(f.duration)));
       if (f.speaker_count > 1) sub.append(el("span", null, `${f.speaker_count} speakers`));
       body.append(sub);
+      const acts = el("div", "factions");
+      const dup = el("button", "fdel fdup"); dup.title = "Duplicate (keeps this one untouched, e.g. to try another model)"; dup.append(svg(ICON_COPY));
+      dup.onclick = (e) => { e.stopPropagation(); duplicateFile(f); };
       const del = el("button", "fdel"); del.title = "Delete"; del.append(svg(ICON_TRASH));
       del.onclick = (e) => { e.stopPropagation(); deleteFiles([f.id]); };
-      li.append(lead, body, S.selectMode ? el("span") : del);
+      acts.append(dup, del);
+      li.append(lead, body, S.selectMode ? el("span") : acts);
       li.onclick = () => {
         if (S.selectMode) { sel ? S.selected.delete(f.id) : S.selected.add(f.id); renderFiles(); }
         else openFile(f.id);
@@ -384,7 +395,7 @@
       S.markers = S.transcript.markers || [];
     } catch { S.transcript = null; S.segs = []; S.speakers = {}; S.markers = []; }
     renderHeader(); renderSegments(); renderSpeakers(); renderMarkers();
-    loadVersions();
+    loadVersions(); loadSounds();
   }
 
   // ------------------------------------------------------------------ header & progress
@@ -433,7 +444,7 @@
     if (f.status === "processing") { $("procTitle").textContent = "Preparing audio…"; $("procDetail").textContent = "Checking the format and converting to MP3 if needed"; return; }
     if (f.status === "queued") { $("procTitle").textContent = "Queued"; $("procDetail").textContent = "Waiting for the current job to finish"; return; }
     if (f.status === "diarizing") {
-      $("procTitle").textContent = p.stage === "voices" ? "Matching voices…" : "Detecting speakers…";
+      $("procTitle").textContent = p.stage === "voices" ? "Matching voices…" : p.stage === "sounds" ? "Listening for laughs, coughs…" : "Detecting speakers…";
       $("procDetail").textContent = `${fmt(f.elapsed || 0)} elapsed · ${p.label || "runs on the server CPU"}`;
     } else {
       const dv = p.device;
@@ -870,6 +881,7 @@
     box.scrollTop = scroll;
     renderFlags();
     updateActive(true);
+    if (S.sounds?.events?.length) markSoundRows();
     if (S.focusSegId != null) {  // a line was just inserted (or its speaker set): keep typing in it
       const k = S.segs.findIndex((x) => x.id === S.focusSegId);
       S.focusSegId = null;
@@ -1282,12 +1294,23 @@
   };
 
   // ------------------------------------------------------------------ player
-  function seekTo(t, play = false) {
+  function seekTo(t, play = false, reveal = false) {
     if (!audio.getAttribute("src")) return;
     audio.currentTime = Math.max(0, Math.min(t, audio.duration || t));
     if (play) audio.play().catch(() => {});
     updateActive(true);
+    if (reveal) revealActive();
     drawWave();
+  }
+  /** Scroll the line at the playhead into view (timeline clicks), even while paused. */
+  function revealActive() {
+    const row = rowEl(S.activeIdx);
+    if (!row || document.activeElement?.classList?.contains("seg-text")) return;
+    const box = $("segments");
+    const rb = row.getBoundingClientRect(), bb = box.getBoundingClientRect();
+    if (rb.top < bb.top + 40 || rb.bottom > bb.bottom - 40) row.scrollIntoView({ block: "center", behavior: "smooth" });
+    row.classList.add("flash"); setTimeout(() => row.classList.remove("flash"), 1200);
+    lastScroll = Date.now();
   }
   function togglePlay() {
     if (!audio.getAttribute("src") || S.tr) return;
@@ -1486,9 +1509,9 @@
   waveWrap.addEventListener("pointerup", (e) => {
     const d = wdrag; wdrag = null;
     if (!d || !waveDur()) return;
-    if (d.type === "seek") seekTo(timeAtX(e.clientX));
+    if (d.type === "seek") seekTo(timeAtX(e.clientX), false, true);
     else if (d.type === "move") {
-      if (d.moved) { markersChanged(); } else seekTo(d.m[d.edge]);
+      if (d.moved) { markersChanged(); } else seekTo(d.m[d.edge], false, true);
     } else if (d.type === "new") {
       if (d.m) { markersChanged(d.m); }
       else { const m = newMarker(d.t0, null); S.markers.push(m); markersChanged(m); }
@@ -2433,15 +2456,16 @@
     const r = document.createRange(); r.selectNodeContents(t);
     const sel = getSelection(); sel.removeAllRanges(); sel.addRange(r);
   };
-  $("copyFileBtn").onclick = async () => {
-    closeMenus();
-    if (!S.current) return;
+  async function duplicateFile(f) {
     try {
-      await flushSave();
-      const m = await api(`/api/files/${S.current.id}/copy`, { method: "POST" });
-      await loadFiles(); await openFile(m.id); toast(`Made a copy: ${m.name}`);
+      if (S.current?.id === f.id) await flushSave();
+      const m = await api(`/api/files/${f.id}/copy`, { method: "POST" });
+      await loadFiles(); await openFile(m.id);
+      const canRun = m.has_audio && !isBusy(m);
+      toast(`Made a copy: ${m.name}`, false, canRun ? { label: "Transcribe it with another model", fn: () => openReprocess() } : null);
     } catch (e) { toast(e.message, true); }
-  };
+  }
+  $("copyFileBtn").onclick = () => { closeMenus(); if (S.current) duplicateFile(S.current); };
   function copyToClipboard(text) {
     if (navigator.clipboard && window.isSecureContext) return navigator.clipboard.writeText(text);
     const ta = el("textarea"); ta.value = text; ta.style.position = "fixed"; ta.style.opacity = "0";
@@ -2538,6 +2562,378 @@
     let down = false;
     $(id).addEventListener("mousedown", (e) => { down = e.target.id === id; });
     $(id).addEventListener("click", (e) => { if (e.target.id === id && down) closeModal(); });
+  }
+
+  // ------------------------------------------------------------------ search clear
+  function syncSearchClear() { $("searchClear").classList.toggle("hidden", !$("searchInput").value); }
+  $("searchInput").addEventListener("input", syncSearchClear);
+  $("searchClear").onclick = () => { $("searchInput").value = ""; syncSearchClear(); applySearch(); $("searchInput").focus(); };
+
+  // ------------------------------------------------------------------ sounds (laughs, coughs …)
+  S.sounds = null;
+  async function loadSounds() {
+    const f = S.current;
+    S.sounds = null;
+    if (!f) return;
+    try { const r = await api(`/api/files/${f.id}/sounds`); if (S.current === f) S.sounds = r; } catch { S.sounds = null; }
+    if (S.current === f) markSoundRows();
+  }
+  /** Small emoji badges on lines where a sound happened (click: play it). */
+  function markSoundRows() {
+    document.querySelectorAll(".seg-sounds").forEach((x) => x.remove());
+    const ev = S.sounds?.events || [];
+    if (!ev.length || !S.segs.length) return;
+    const groups = S.sounds.groups || {};
+    const per = new Map();
+    for (const e of ev) {
+      let best = -1, bd = Infinity;
+      S.segs.forEach((s, i) => {
+        const d = e.start > s.end ? e.start - s.end : s.start > e.end ? s.start - e.end : 0;
+        if (d < bd || (d === bd && e.speaker && s.speaker === e.speaker)) { bd = d; best = i; }
+      });
+      if (best >= 0 && bd < 3) { if (!per.has(best)) per.set(best, []); per.get(best).push(e); }
+    }
+    for (const [i, list] of per) {
+      const left = rowEl(i)?.querySelector(".seg-left");
+      if (!left) continue;
+      const box = el("span", "seg-sounds");
+      for (const e of list.slice(0, 4)) {
+        const b = el("button", "snd", groups[e.label]?.emoji || "•");
+        b.title = `${e.label}${e.speaker ? ` · ${spkName(e.speaker)}${e.sure ? "" : " (guess)"}` : ""} at ${fmt(e.start)} · ${Math.round(e.p * 100)}% sure · click to hear it`;
+        b.onclick = (x) => { x.stopPropagation(); playSpan(e.start - 0.5, e.end + 0.5); };
+        box.append(b);
+      }
+      left.append(box);
+    }
+  }
+  function playSpan(a, b) {
+    seekTo(Math.max(0, a), true, true);
+    S.stopAt = b;
+  }
+
+  // ------------------------------------------------------------------ stats
+  const STOP = new Set(("a about above after again against all am an and any are aren't as at be because been before being below between both but by " +
+    "can can't cannot could couldn't did didn't do does doesn't doing don't down during each few for from further had hadn't has hasn't have haven't having he " +
+    "he'd he'll he's her here here's hers herself him himself his how how's i i'd i'll i'm i've if in into is isn't it it's its itself let's me more most mustn't " +
+    "my myself no nor not of off on once only or other ought our ours ourselves out over own same shan't she she'd she'll she's should shouldn't so some such than " +
+    "that that's the their theirs them themselves then there there's these they they'd they'll they're they've this those through to too under until up very " +
+    "was wasn't we we'd we'll we're we've were weren't what what's when when's where where's which while who who's whom why why's with won't would wouldn't you " +
+    "you'd you'll you're you've your yours yourself yourselves yeah yes okay ok oh um uh uhm hmm mm mhm mm-hmm like just know get got go going gonna wanna gotta " +
+    "really right well also one two thing things think said say says see mean kind sort lot also even still back way would could much many now then thats dont " +
+    "im youre its cause 'cause ah eh huh er ya yep nope").split(" "));
+  const FILLERS = ["um", "uh", "uhm", "er", "ah", "hmm", "like", "you know", "i mean", "sort of", "kind of", "basically", "literally", "actually", "right", "so yeah"];
+  const WRITTEN = /\((?:laugh|laughs|laughing|laughter|chuckles?|giggles?)\)|\[(?:laugh|laughs|laughing|laughter)\]|\b(?:ha){2,}\b|\bhehe+\b|\blol\b/gi;
+  const tokens = (text) => text.replace(/\[REDACTED(?::[a-z0-9]+)?\]/g, " ").toLowerCase().replace(/[’‘]/g, "'")
+    .split(/\s+/).map((w) => w.replace(/^[^\p{L}\p{N}']+|[^\p{L}\p{N}']+$/gu, "")).filter(Boolean);
+
+  function computeStats() {
+    const segs = S.segs.filter((s) => s.text.trim());
+    const ids = Object.keys(S.speakers);
+    const sp = {};
+    const blank = () => ({ talk: 0, words: 0, turns: 0, questions: 0, fillers: {}, freq: new Map(), grams: new Map(), longest: null,
+      interrupts: 0, quick: 0, written: 0, longestWord: "", sounds: {} });
+    for (const id of ids) sp[id] = blank();
+    const allFreq = new Map(), allGrams = new Map();
+    let prev = null, run = null, total = 0, longestGap = null;
+    const runs = [];
+    for (const s of segs) {
+      const id = s.speaker || "?";
+      if (!sp[id]) sp[id] = blank();
+      const st = sp[id];
+      const dur = Math.max(0, s.end - s.start);
+      const toks = tokens(s.text);
+      st.talk += dur; st.words += toks.length; total += toks.length;
+      st.questions += (s.text.match(/\?/g) || []).length;
+      st.written += (s.text.match(WRITTEN) || []).length;
+      const joined = " " + toks.join(" ") + " ";
+      for (const f of FILLERS) {
+        const n = joined.split(" " + f + " ").length - 1;
+        if (n) st.fillers[f] = (st.fillers[f] || 0) + n;
+      }
+      for (let k = 0; k < toks.length; k++) {
+        const w = toks[k];
+        if (w.length > st.longestWord.length && /^[\p{L}'-]+$/u.test(w) && w.length < 25) st.longestWord = w;
+        if (!STOP.has(w) && w.length > 2 && !/^\d+$/.test(w)) {
+          st.freq.set(w, (st.freq.get(w) || 0) + 1); allFreq.set(w, (allFreq.get(w) || 0) + 1);
+        }
+        for (const n of [2, 3]) {
+          const g = toks.slice(k, k + n);
+          if (g.length < n || g.every((x) => STOP.has(x)) || STOP.has(g[0]) && STOP.has(g[n - 1])) continue;
+          const key = g.join(" ");
+          st.grams.set(key, (st.grams.get(key) || 0) + 1); allGrams.set(key, (allGrams.get(key) || 0) + 1);
+        }
+      }
+      if (prev) {
+        const gap = s.start - prev.end;
+        if (!longestGap || gap > longestGap.gap) longestGap = { gap, at: prev.end };
+        if (prev.speaker !== s.speaker) {
+          if (gap < -0.3) st.interrupts++;
+          else if (gap < 0.25) st.quick++;
+        }
+      }
+      if (run && run.id === id) { run.end = s.end; run.words += toks.length; run.n++; }
+      else { if (run) runs.push(run); run = { id, start: s.start, end: s.end, words: toks.length, n: 1, text: s.text }; }
+      prev = s;
+    }
+    if (run) runs.push(run);
+    for (const r of runs) {
+      const st = sp[r.id];
+      st.turns++;
+      if (!st.longest || r.end - r.start > st.longest.end - st.longest.start) st.longest = r;
+    }
+    // sounds per speaker
+    for (const e of S.sounds?.events || []) {
+      if (e.speaker && sp[e.speaker]) sp[e.speaker].sounds[e.label] = (sp[e.speaker].sounds[e.label] || 0) + 1;
+    }
+    const talkTotal = Object.values(sp).reduce((a, x) => a + x.talk, 0);
+    const duration = S.current?.duration || (segs.length ? segs[segs.length - 1].end : 0);
+    // busiest 5 minutes
+    const bucket = 300;
+    const perBucket = new Map();
+    for (const s of segs) { const b = Math.floor(s.start / bucket); perBucket.set(b, (perBucket.get(b) || 0) + tokens(s.text).length); }
+    let busiest = null;
+    for (const [b, n] of perBucket) if (!busiest || n > busiest.n) busiest = { b, n };
+    return { sp, ids: Object.keys(sp).filter((id) => sp[id].words || sp[id].talk), runs, total, talkTotal, duration, longestGap, busiest, bucket, allFreq, allGrams, segs };
+  }
+
+  function topN(map, n, min = 2) { return [...map].filter(([, c]) => c >= min).sort((a, b) => b[1] - a[1]).slice(0, n); }
+  /** Phrases this speaker says much more than the others (log-odds-ish). */
+  function signature(st, all, n) {
+    return [...st.grams].filter(([g, c]) => c >= 3 && g.split(" ").filter((w) => !STOP.has(w)).length >= 1)
+      .map(([g, c]) => [g, c, c / ((all.get(g) || c) - c + 1)])
+      .sort((a, b) => b[2] - a[2] || b[1] - a[1]).slice(0, n);
+  }
+  const mmss = (sec) => fmt(Math.round(sec || 0));
+  function timeLink(t, label) {
+    const b = el("button", "linklike", label || fmt(t));
+    b.onclick = () => { closeModal(); seekTo(t, false, true); };
+    return b;
+  }
+
+  function renderStats() {
+    const body = $("statsBody");
+    body.innerHTML = "";
+    if (!S.segs.length) { body.append(el("p", "muted", "No transcript yet.")); return; }
+    const X = computeStats();
+    const names = (id) => (id === "?" ? "Unassigned" : spkName(id));
+    const color = (id) => (id === "?" ? "var(--muted)" : spkColor(id));
+
+    // headline tiles
+    const tiles = el("div", "st-tiles");
+    const tile = (v, l) => { const t = el("div", "st-tile"); t.append(el("b", null, v), el("span", null, l)); tiles.append(t); };
+    tile(mmss(X.duration), "recording");
+    tile(X.total.toLocaleString(), "words");
+    tile(String(X.ids.length), X.ids.length === 1 ? "speaker" : "speakers");
+    tile(X.duration ? Math.round((X.total / X.duration) * 60) + "" : "–", "words per minute");
+    tile(String(X.runs.length), "turns");
+    if (X.longestGap && X.longestGap.gap > 1) tile(X.longestGap.gap.toFixed(1) + "s", "longest silence");
+    body.append(tiles);
+
+    // awards
+    if (X.ids.length >= 2) {
+      const aw = el("div", "st-awards");
+      const award = (emoji, title, pick, fmtv) => {
+        const id = X.ids.reduce((a, b) => (pick(X.sp[b]) > pick(X.sp[a]) ? b : a));
+        const v = pick(X.sp[id]);
+        if (!v || X.ids.some((o) => o !== id && pick(X.sp[o]) === v)) return;  // no award for a tie
+        const c = el("div", "st-award");
+        const dot = el("i"); dot.style.background = color(id);
+        c.append(el("span", "em", emoji), el("b", null, title));
+        const who = el("span"); who.append(dot, document.createTextNode(" " + names(id) + " · " + fmtv(v, X.sp[id])));
+        c.append(who); aw.append(c);
+      };
+      award("🗣️", "Chatterbox", (s) => s.words, (v) => `${v.toLocaleString()} words`);
+      award("⚡", "Speed talker", (s) => (s.talk > 30 ? s.words / (s.talk / 60) : 0), (v) => `${Math.round(v)} wpm`);
+      award("🎤", "Longest monologue", (s) => (s.longest ? s.longest.end - s.longest.start : 0), (v) => mmss(v));
+      award("❓", "Question master", (s) => s.questions, (v) => `${v} question${v === 1 ? "" : "s"}`);
+      award("😂", "Giggler", (s) => (s.sounds.Laughter || 0) + s.written, (v) => `${v} laugh${v === 1 ? "" : "s"}`);
+      award("🤔", "Um-ometer", (s) => (s.words > 50 ? (Object.entries(s.fillers).filter(([f]) => ["um", "uh", "uhm", "er", "ah", "hmm"].includes(f)).reduce((a, [, n]) => a + n, 0) / s.words) * 100 : 0), (v) => `${v.toFixed(1)} per 100 words`);
+      award("✋", "Interrupter", (s) => s.interrupts, (v) => `${v} time${v === 1 ? "" : "s"}`);
+      body.append(aw);
+    }
+
+    // talk share bars + timeline
+    const share = el("section", "st-section");
+    share.append(el("h4", null, "Who talked"));
+    for (const id of [...X.ids].sort((a, b) => X.sp[b].talk - X.sp[a].talk)) {
+      const st = X.sp[id];
+      const row = el("div", "st-share");
+      const pct = X.talkTotal ? (st.talk / X.talkTotal) * 100 : 0;
+      const bar = el("div", "st-bar");
+      const fill = el("i"); fill.style.width = Math.max(1, pct) + "%"; fill.style.background = color(id);
+      bar.append(fill);
+      row.append(el("span", "st-name", names(id)), bar, el("span", "st-val", `${mmss(st.talk)} · ${Math.round(pct)}%`));
+      share.append(row);
+    }
+    share.append(timelineChart(X, names, color));
+    body.append(share);
+
+    // per-speaker cards
+    const cards = el("div", "st-cards");
+    for (const id of X.ids) {
+      const st = X.sp[id];
+      const card = el("section", "st-card");
+      card.style.setProperty("--spk", color(id));
+      card.append(el("h4", null, names(id)));
+      const dl = el("dl", "st-dl");
+      const item = (k, v) => { dl.append(el("dt", null, k)); const dd = el("dd"); typeof v === "string" ? (dd.textContent = v) : dd.append(v); dl.append(dd); };
+      item("Talk time", `${mmss(st.talk)} (${X.talkTotal ? Math.round((st.talk / X.talkTotal) * 100) : 0}%)`);
+      item("Words", `${st.words.toLocaleString()} · ${st.talk > 5 ? Math.round(st.words / (st.talk / 60)) : "–"} per minute`);
+      item("Turns", `${st.turns} · avg ${st.turns ? mmss(st.talk / st.turns) : "–"}`);
+      if (st.longest) {
+        const v = el("span");
+        v.append(document.createTextNode(`${mmss(st.longest.end - st.longest.start)} (${st.longest.words} words) at `), timeLink(st.longest.start));
+        item("Longest uninterrupted", v);
+      }
+      item("Questions asked", String(st.questions));
+      const um = Object.entries(st.fillers).sort((a, b) => b[1] - a[1]);
+      const umTotal = um.reduce((a, [, n]) => a + n, 0);
+      item("Filler words", umTotal ? `${umTotal} (${((umTotal / Math.max(1, st.words)) * 100).toFixed(1)} per 100 words) · ${um.slice(0, 3).map(([f, n]) => `"${f}" ×${n}`).join(", ")}` : "none");
+      if (X.ids.length > 1) item("Jumped in", `${st.interrupts} interruptions · ${st.quick} instant replies`);
+      const vocab = st.freq.size;
+      item("Vocabulary", `${vocab.toLocaleString()} different words` + (st.longestWord.length > 9 ? ` · biggest: "${st.longestWord}"` : ""));
+      const snd = Object.entries(st.sounds).sort((a, b) => b[1] - a[1]);
+      if (snd.length || st.written) {
+        const g = S.sounds?.groups || {};
+        item("Sounds", [...snd.map(([l, n]) => `${g[l]?.emoji || ""} ${n} ${l.toLowerCase()}${n > 1 && !/s$/.test(l) ? "s" : ""}`), st.written ? `${st.written} written laughs` : null].filter(Boolean).join(" · "));
+      }
+      card.append(dl);
+      const words = topN(st.freq, 12);
+      if (words.length) {
+        card.append(el("div", "st-sub", "Most used words"));
+        const chips = el("div", "st-chips");
+        const max = words[0][1];
+        for (const [w, n] of words) {
+          const c = el("button", "st-chip");
+          c.style.setProperty("--w", (0.35 + 0.65 * (n / max)).toFixed(2));
+          c.append(document.createTextNode(w), el("small", null, String(n)));
+          c.title = `Search for "${w}"`;
+          c.onclick = () => { closeModal(); $("searchInput").value = w; syncSearchClear(); applySearch(); };
+          chips.append(c);
+        }
+        card.append(chips);
+      }
+      const sig = signature(st, X.allGrams, 4);
+      if (sig.length) {
+        card.append(el("div", "st-sub", "Signature phrases"));
+        const chips = el("div", "st-chips");
+        for (const [g, n] of sig) {
+          const c = el("button", "st-chip phrase");
+          c.append(document.createTextNode(`“${g}”`), el("small", null, String(n)));
+          c.onclick = () => { closeModal(); $("searchInput").value = g; syncSearchClear(); applySearch(); };
+          chips.append(c);
+        }
+        card.append(chips);
+      }
+      cards.append(card);
+    }
+    body.append(cards);
+
+    // sounds section
+    const ss = el("section", "st-section");
+    ss.append(el("h4", null, "Laughs, coughs & other sounds"));
+    const snd = S.sounds;
+    if (!snd || !snd.available) {
+      ss.append(el("p", "muted small", "Sound detection isn't available in this container."));
+    } else if (!snd.detected) {
+      ss.append(el("p", "muted small", "Listen to the audio for laughter, coughs, sneezes, sighs, applause, music and pets, and guess who made each sound. Takes about 30 seconds per hour of audio on the CPU."));
+      const go = el("button", "btn primary sm", "Detect sounds");
+      go.disabled = !S.current?.has_audio || isBusy(S.current);
+      go.onclick = async () => {
+        try {
+          S.current = await api(`/api/files/${S.current.id}/sounds`, { method: "POST" });
+          S.pendingSounds = S.current.id;
+          closeModal(); renderHeader(); await loadFiles(); schedulePoll();
+        } catch (e) { toast(e.message, true); }
+      };
+      ss.append(go);
+    } else {
+      const counts = {};
+      for (const e of snd.events) counts[e.label] = (counts[e.label] || 0) + 1;
+      const order = Object.entries(counts).sort((a, b) => b[1] - a[1]);
+      if (!order.length) ss.append(el("p", "muted small", "No laughs, coughs or other sounds were detected."));
+      const tl = el("div", "st-chips");
+      for (const [l, n] of order) tl.append(el("span", "st-chip static", `${snd.groups[l]?.emoji || ""} ${l} ${n}`));
+      ss.append(tl);
+      const list = el("ul", "st-events");
+      for (const e of snd.events.slice(0, 200)) {
+        const li = el("li");
+        li.append(el("span", "em", snd.groups[e.label]?.emoji || "•"), timeLink(e.start));
+        li.append(el("span", null, e.label + (e.speaker ? ` · ${names(e.speaker)}${e.sure ? "" : " (guess)"}` : "")));
+        const play = el("button", "linklike", "▶ play");
+        play.onclick = () => playSpan(e.start - 0.5, e.end + 0.5);
+        li.append(play);
+        list.append(li);
+      }
+      ss.append(list);
+      const again = el("button", "btn sm", "Detect again");
+      again.onclick = async () => { try { S.current = await api(`/api/files/${S.current.id}/sounds`, { method: "POST" }); S.pendingSounds = S.current.id; closeModal(); renderHeader(); await loadFiles(); schedulePoll(); } catch (e) { toast(e.message, true); } };
+      ss.append(el("p", "muted small", "Detected by a small sound model, so expect some misses and false alarms. Who made each sound is matched by voice when it's clear, otherwise it's whoever was talking (marked guess)."), again);
+    }
+    body.append(ss);
+  }
+
+  /** Stacked bars of talk time per slice of the recording, with hover details. */
+  function timelineChart(X, names, color) {
+    const wrap = el("div", "st-timeline");
+    const n = Math.min(40, Math.max(8, Math.round(X.duration / 120)));
+    const step = X.duration / n || 1;
+    const slices = Array.from({ length: n }, () => ({}));
+    for (const s of X.segs) {
+      const id = s.speaker || "?";
+      let a = s.start;
+      while (a < s.end) {
+        const k = Math.min(n - 1, Math.floor(a / step));
+        const b = Math.min(s.end, (k + 1) * step);
+        slices[k][id] = (slices[k][id] || 0) + (b - a);
+        if (b <= a) break;
+        a = b;
+      }
+    }
+    const legend = el("div", "st-legend");
+    for (const id of X.ids) { const l = el("span"); const d = el("i"); d.style.background = color(id); l.append(d, document.createTextNode(names(id))); legend.append(l); }
+    const plot = el("div", "st-plot");
+    slices.forEach((sl, k) => {
+      const col = el("button", "st-col");
+      const from = k * step, to = (k + 1) * step;
+      for (const id of X.ids) {
+        const v = sl[id] || 0;
+        if (!v) continue;
+        const seg = el("i"); seg.style.height = Math.min(100, (v / step) * 100) + "%"; seg.style.background = color(id);
+        col.append(seg);
+      }
+      col.dataset.tip = `${fmt(from)}–${fmt(to)}\n` + X.ids.map((id) => `${names(id)}: ${mmss(sl[id] || 0)}`).join("\n");
+      col.onmouseenter = (e) => showTip(col, col.dataset.tip);
+      col.onmouseleave = hideTip;
+      col.onclick = () => { closeModal(); seekTo(from, false, true); };
+      plot.append(col);
+    });
+    const axis = el("div", "st-axis");
+    axis.append(el("span", null, "0:00"), el("span", null, fmt(X.duration / 2)), el("span", null, fmt(X.duration)));
+    wrap.append(el("div", "st-sub", "Talk time across the recording (click a bar to jump there)"), legend, plot, axis);
+    return wrap;
+  }
+  function showTip(anchor, text) {
+    const t = $("chartTip");
+    t.textContent = text; t.classList.remove("hidden");
+    const r = anchor.getBoundingClientRect();
+    t.style.left = Math.min(innerWidth - t.offsetWidth - 8, Math.max(8, r.left + r.width / 2 - t.offsetWidth / 2)) + "px";
+    t.style.top = (r.top - t.offsetHeight - 8) + "px";
+  }
+  function hideTip() { $("chartTip").classList.add("hidden"); }
+
+  $("statsBtn").onclick = async () => {
+    if (!S.current || !S.segs.length) { toast("Transcribe the file first"); return; }
+    await flushSave();
+    if (!S.sounds) await loadSounds();
+    renderStats();
+    openModal("statsModal");
+  };
+  $("stClose").onclick = () => { hideTip(); closeModal(); };
+  {
+    let down = false;
+    $("statsModal").addEventListener("mousedown", (e) => { down = e.target.id === "statsModal"; });
+    $("statsModal").addEventListener("click", (e) => { if (e.target.id === "statsModal" && down) { hideTip(); closeModal(); } });
   }
 
   // ------------------------------------------------------------------ empty state art

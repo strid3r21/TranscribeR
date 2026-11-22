@@ -16,3 +16,11 @@ with tarfile.open(fileobj=io.BytesIO(seg), mode="r:bz2") as tf:
 
 urllib.request.urlretrieve(f"{BASE}/speaker-recongition-models/nemo_en_titanet_small.onnx", out / "embedding.onnx")
 print("models:", sorted(p.name for p in out.iterdir()))
+
+# Sound events (laughter, cough, sneeze, ...): CED-mini AudioSet tagger, int8 (~10 MB).
+ced = urllib.request.urlopen(f"{BASE}/audio-tagging-models/sherpa-onnx-ced-mini-audio-tagging-2024-04-19.tar.bz2").read()
+with tarfile.open(fileobj=io.BytesIO(ced), mode="r:bz2") as tf:
+    root = "sherpa-onnx-ced-mini-audio-tagging-2024-04-19"
+    (out / "sounds.onnx").write_bytes(tf.extractfile(tf.getmember(f"{root}/model.int8.onnx")).read())
+    (out / "sounds_labels.csv").write_bytes(tf.extractfile(tf.getmember(f"{root}/class_labels_indices.csv")).read())
+print("models:", sorted(p.name for p in out.iterdir()))
