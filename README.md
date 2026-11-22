@@ -119,3 +119,13 @@ Jobs run one at a time so llama-swap isn't asked to swap models mid-job. Queued 
 pip install -r requirements.txt
 cd app && DATA_DIR=../data LLAMA_SWAP_URL=http://your-host:8080 uvicorn main:app --reload
 ```
+
+## Publishing the image
+
+GitHub Actions builds the image when it can (`.github/workflows/docker.yml`). To publish from a workstation instead, run:
+
+```bash
+scripts/publish.sh
+```
+
+It builds, pushes `ghcr.io/strid3r21/transcriber:<sha>`, and rewrites the manifest as Docker v2 schema 2 for both `latest` and the sha tag. Docker's containerd image store pushes OCI manifests, and Unraid's *Check for updates* can't read them (it shows "not available").
