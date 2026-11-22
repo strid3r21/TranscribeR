@@ -121,6 +121,7 @@ class _Local:
         self.path = path
         self.model = None
         self.backend = "?"
+        self.device = None
 
     def _load(self) -> None:
         import transcribe_cpp as tc
@@ -128,7 +129,14 @@ class _Local:
         self.tc = tc
         self.model = tc.Model(str(self.path), backend=cfg.MOSS_BACKEND)
         self.backend = self.model.backend
-        log.info("MOSS loaded on %s", self.backend)
+        try:
+            dev = self.model.device
+            gpu = (dev.device_type or dev.kind or "").lower() not in ("cpu", "")
+            name = dev.description or dev.name
+        except Exception:  # noqa: BLE001
+            gpu, name = self.backend.lower() != "cpu", self.backend
+        self.device = {"kind": "GPU" if gpu else "CPU", "name": name}
+        log.info("MOSS loaded on %s (%s)", self.backend, name)
 
     def _run(self, audio: Path, a: float, b: float, opts: dict):
         tc = self.tc
@@ -178,6 +186,7 @@ class _Remote:
         self.model = model
         self.client = httpx.AsyncClient(timeout=httpx.Timeout(cfg.REQUEST_TIMEOUT, connect=30.0))
         self.label = "transcriptions (moss)"
+        self.device = {"kind": "llama-swap", "name": cfg.LLAMA_SWAP_URL}
 
     async def start(self) -> None:
         pass
@@ -278,6 +287,7 @@ async def transcribe_file(audio: Path, duration: float, opts: dict, work_dir: Pa
     done_secs, runs = 0.0, 0
     progress({"stage": "transcribing", "label": None, "done": 0, "total": len(chunks)})
     await runner.start()
+    progress({"device": runner.device})
     try:
         pending = list(chunks)
         while pending:
@@ -338,7 +348,7 @@ async def transcribe_file(audio: Path, duration: float, opts: dict, work_dir: Pa
         words.extend(ws)
     speakers = {label: {"name": f"Speaker {label[1:]}", "_idx": spk} for spk, label in order.items()}
     return {"words": words, "speakers": speakers, "centroids": centroids, "notes": notes,
-            "model": model, "api": runner.label, "chunks": len(chunks)}
+            "model": model, "api": runner.label, "chunks": len(chunks), "device": runner.device}
 
 
 async def transcribe_window(audio: Path, start: float, end: float, model: str, work_dir: Path) -> str:

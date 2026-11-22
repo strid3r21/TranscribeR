@@ -233,7 +233,7 @@ async def run_diarization(fid: str, audio: Path, num_speakers: int):
 
 async def job_transcribe(fid: str, opts: dict) -> None:
     d = fdir(fid)
-    meta = update_meta(fid, status="transcribing", started_at=time.time(), error=None,
+    meta = update_meta(fid, status="transcribing", started_at=time.time(), error=None, device=None,
                        model=opts.get("model") or cfg.DEFAULT_MODEL)
     audio = d / "audio.mp3"
     PROGRESS[fid] = {"stage": "starting"}
@@ -283,7 +283,8 @@ async def job_transcribe(fid: str, opts: dict) -> None:
         write_json(d / "transcript.orig.json", transcript)
         write_json(d / "transcript.json", transcript)
         update_meta(fid, status="done", transcribed_at=time.time(), transcribe_seconds=round(time.time() - t0, 1),
-                    api=result["api"], chunks=result["chunks"], speaker_count=len(speakers))
+                    api=result["api"], chunks=result["chunks"], speaker_count=len(speakers),
+                    device=result.get("device"))
     except Exception as exc:  # noqa: BLE001
         log.exception("transcription failed for %s", fid)
         if diar_task and not diar_task.done():

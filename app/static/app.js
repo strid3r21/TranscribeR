@@ -383,6 +383,12 @@
     if (f.size) add(fmtSize(f.size));
     if (f.source_format) add(f.converted ? `${f.source_format} → MP3` : f.source_format);
     if (f.model && f.status === "done") add("🧠 " + f.model);
+    const dev = isBusy(f) ? f.progress?.device : (f.status === "done" ? f.device : null);
+    if (dev) {
+      const tag = el("span", "dev-tag dev-" + dev.kind.toLowerCase().replace(/[^a-z]/g, ""), dev.kind);
+      tag.title = dev.name || dev.kind;
+      meta.append(tag);
+    }
     if (f.transcribe_seconds) add(`took ${fmt(f.transcribe_seconds)}${f.chunks > 1 ? ` · ${f.chunks} chunks` : ""}`);
     if (S.transcript?.timing === "estimated") add("word timing estimated");
 
@@ -412,7 +418,9 @@
       $("procTitle").textContent = p.stage === "voices" ? "Matching voices…" : "Detecting speakers…";
       $("procDetail").textContent = `${fmt(f.elapsed || 0)} elapsed · ${p.label || "runs on the server CPU"}`;
     } else {
-      $("procTitle").textContent = `Transcribing with ${f.model || "model"}…`;
+      const dv = p.device;
+      $("procTitle").textContent = `Transcribing with ${f.model || "model"}${dv ? (dv.kind === "llama-swap" ? " via llama-swap" : ` on ${dv.kind}`) : ""}…`;
+      $("procTitle").title = dv?.name || "";
       let detail = `${fmt(f.elapsed || 0)} elapsed`;
       if (p.label) detail += ` · ${p.label}`;
       else if (p.stage === "speakers") detail += " · matching speakers to text";
